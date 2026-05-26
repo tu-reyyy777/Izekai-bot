@@ -387,12 +387,24 @@ async function startBot() {
     let reconnectAttempts = 0;
     const MAX_RECONNECT_ATTEMPTS = 5;
     const { state, saveCreds } = await useMultiFileAuthState("./session");
-    const sock = makeWASocket({ auth: state, logger: P({ level: "silent" }), printQRInTerminal: false });
+    const sock = makeWASocket({
+    auth: state,
+    logger: P({ level: "silent" }),
+    printQRInTerminal: false,
+    browser: ['Ubuntu', 'Chrome', '20.0.04'],
+    syncFullHistory: false,
+    markOnlineOnConnect: true,
+    generateHighQualityLinkPreview: true
+});
     sock.ev.on("creds.update", saveCreds);
 
     sock.ev.on("connection.update", async (update) => {
         const { connection, lastDisconnect } = update;
-        if (connection === "connecting") {
+        if (connection === "open") {
+
+            reconnectAttempts = 0;
+
+            log(LOG_LEVELS.SUCCESS, `${BOT_CONFIG.botName} conectado exitosamente 😺`);
 
             const creds = state.creds;
 
@@ -402,7 +414,7 @@ async function startBot() {
 
                 const phoneNumber = process.env.NUMERO;
 
-                await new Promise(resolve => setTimeout(resolve, 15000));
+                await new Promise(resolve => setTimeout(resolve, 5000));
 
                 try {
 
@@ -418,10 +430,6 @@ async function startBot() {
             }
         }
 
-        if (connection === "open") {
-            reconnectAttempts = 0;
-            log(LOG_LEVELS.SUCCESS, `${BOT_CONFIG.botName} conectado exitosamente 😺`);
-        }
 
         if (connection === "close") {
 

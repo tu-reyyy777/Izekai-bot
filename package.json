@@ -8,7 +8,7 @@
     "dev": "nodemon index.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.6.0",
+    "@whiskeysockets/baileys": "^7.0.0-rc13",
     "axios": "^1.16.1",
     "cheerio": "^1.2.0",
     "pino": "^8.17.2",
