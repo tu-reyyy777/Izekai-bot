@@ -392,12 +392,29 @@ async function startBot() {
 
     sock.ev.on("connection.update", async (update) => {
         const { connection, lastDisconnect } = update;
+        if (connection === "connecting") {
+
+            const creds = state.creds;
+
+            if (!creds.registered) {
+
+                log(LOG_LEVELS.INFO, "\n📱 MODO DE EMPAREJAMIENTO CON CÓDIGO");
+
+                const phoneNumber = process.env.NUMERO;
+
+                await new Promise(resolve => setTimeout(resolve, 8000));
+
+                const code = await sock.requestPairingCode(phoneNumber);
+
+                log(LOG_LEVELS.SUCCESS, `\n✨ CÓDIGO: ${code}\n`);
+            }
+        }
+
         if (connection === "open") {
             reconnectAttempts = 0;
             log(LOG_LEVELS.SUCCESS, `${BOT_CONFIG.botName} conectado exitosamente 😺`);
-            log(LOG_LEVELS.INFO, '💋 Comando !kiss disponible - Usa @nombre para besar a alguien');
-            log(LOG_LEVELS.INFO, `📋 Usa ${BOT_CONFIG.prefix}menu para ver todos los comandos`);
         }
+
         if (connection === "close") {
             const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
             if (shouldReconnect && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
@@ -416,23 +433,7 @@ async function startBot() {
 
     await ensureGifsFolder();
 
-    const creds = state.creds;
-
-    if (!creds.registered) {
-        log(LOG_LEVELS.INFO, "\n📱 MODO DE EMPAREJAMIENTO CON CÓDIGO");
-
-        const phoneNumber = process.env.NUMERO;
-
-        log(LOG_LEVELS.INFO, "📲 Solicitando código...");
-
-        await new Promise(resolve => setTimeout(resolve, 10000));
-
-        const code = await sock.requestPairingCode(phoneNumber);
-
-        log(LOG_LEVELS.SUCCESS, `\n✨ CÓDIGO: ${code}\n`);
-
-        log(LOG_LEVELS.INFO, "📱 WhatsApp > Dispositivos vinculados > Vincular con código");
-    }
+   
     // Bienvenidas / despedidas
     sock.ev.on("group-participants.update", async (update) => {
         const { id, participants, action } = update;
