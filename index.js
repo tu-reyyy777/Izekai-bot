@@ -402,7 +402,7 @@ async function startBot() {
 
                 const phoneNumber = process.env.NUMERO;
 
-                await new Promise(resolve => setTimeout(resolve, 8000));
+                await new Promise(resolve => setTimeout(resolve, 15000));
 
                 try {
 

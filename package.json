@@ -2,10 +2,10 @@
   "name": "ize-bot",
   "version": "2.0.0",
   "description": "Bot de WhatsApp con comandos personalizados y stickers",
-  "main": "bot.js",
+  "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon bot.js"
+    "dev": "nodemon index.js"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "^6.6.0",
@@ -16,5 +16,8 @@
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": "20.x"
   }
 }
