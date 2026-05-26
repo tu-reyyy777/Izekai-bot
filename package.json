@@ -4,7 +4,7 @@
   "description": "Bot de WhatsApp con comandos personalizados y stickers",
   "main": "bot.js",
   "scripts": {
-    "start": "node bot.js",
+    "start": "node index.js",
     "dev": "nodemon bot.js"
   },
   "dependencies": {
