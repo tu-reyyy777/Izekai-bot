@@ -878,7 +878,7 @@ async function startBot() {
                         mentions.push(sender);
                     } else if (target && targetName) {
                         const targetPhone = target.split('@')[0];
-                        frutiMessage = `@${senderPhone} ${randomPhrase} @${targetPhone} (${targetName}) `;
+                        frutiMessage = `@${senderPhone} ${randomPhrase} @${targetPhone} `;
                         mentions.push(sender, target);
                     } else {
                         frutiMessage = `@${senderPhone} ${randomPhrase} el vacío `;
