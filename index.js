@@ -234,38 +234,41 @@ async function ensureGifsFolder() {
     if (!fs.existsSync(gifsDir)) {
         fs.mkdirSync(gifsDir);
         log(LOG_LEVELS.WARNING, 'Carpeta "gifs" creada. Agrega GIFs de besos allí.');
-        fs.writeFileSync(path.join(gifsDir, 'README.txt'), 'Agrega aquí tus GIFs de besos anime.\nFormatos soportados: .gif, .mp4, .webp\nEl bot los usará automáticamente para el comando !kiss');
+        fs.writeFileSync(path.join(gifsDir, 'README.txt'), 'Agrega aquí tus GIFs de besos anime.\nFormatos soportados: .gif, .mp4\nEl bot los usará automáticamente para el comando !kiss');
     }
 }
 
-async function getRandomKissSticker() {
+// ============ NUEVA FUNCIÓN: OBTENER GIF NORMAL (NO STICKER) ============
+async function getRandomKissGif() {
     try {
         const gifsDir = path.join(__dirname, 'gifs');
         if (!fs.existsSync(gifsDir)) return null;
         const files = fs.readdirSync(gifsDir);
-        const gifFiles = files.filter(f => f.endsWith('.gif') || f.endsWith('.mp4') || f.endsWith('.webp'));
-        if (gifFiles.length === 0) return null;
-        const randomGif = gifFiles[Math.floor(Math.random() * gifFiles.length)];
-        const gifBuffer = fs.readFileSync(path.join(gifsDir, randomGif));
-        const sticker = new Sticker(gifBuffer, { pack: BOT_CONFIG.botName, author: 'Kisses 💋', type: 'full', quality: 80 });
-        return await sticker.toBuffer();
+        const mediaFiles = files.filter(f => f.endsWith('.gif') || f.endsWith('.mp4'));
+        if (mediaFiles.length === 0) return null;
+        const randomFile = mediaFiles[Math.floor(Math.random() * mediaFiles.length)];
+        const fileBuffer = fs.readFileSync(path.join(gifsDir, randomFile));
+        const ext = path.extname(randomFile).toLowerCase();
+        if (ext === '.gif') {
+            return { buffer: fileBuffer, mimetype: 'image/gif', isGif: true };
+        } else if (ext === '.mp4') {
+            return { buffer: fileBuffer, mimetype: 'video/mp4', isMp4: true };
+        }
+        return null;
     } catch (error) {
-        log(LOG_LEVELS.ERROR, `Error creando sticker: ${error}`);
+        log(LOG_LEVELS.ERROR, `Error en getRandomKissGif: ${error}`);
         return null;
     }
 }
 
-
-// ============ OBTENER STICKER DE EXPLOSIÓN ============
+// ============ OBTENER STICKER DE EXPLOSIÓN (sin cambios) ============
 async function getRandomExplosionSticker() {
     try {
         const explosionsDir = path.join(__dirname, 'explosions');
         
-        // Crear carpeta si no existe (opcional, para que el usuario sepa dónde poner sus stickers)
         if (!fs.existsSync(explosionsDir)) {
             fs.mkdirSync(explosionsDir);
             log(LOG_LEVELS.WARNING, 'Carpeta "explosions" creada. Agrega ahí stickers/GIFs de explosiones.');
-            // Crear README informativo
             fs.writeFileSync(path.join(explosionsDir, 'README.txt'), 
                 'Agrega aquí tus stickers/GIFs de explosiones para el comando !detonar.\n' +
                 'Formatos soportados: .gif, .mp4, .webp\n' +
@@ -298,19 +301,15 @@ async function getRandomExplosionSticker() {
 
 async function createStickerFromMedia(buffer, mimeType) {
     try {
-        // Configuración básica del sticker
         const stickerConfig = {
             pack: BOT_CONFIG.botName,
             author: 'Sticker Bot',
             type: 'full',
             quality: 80
         };
-
-        // Si es un video (mp4) o GIF, lo tratamos como sticker animado
         if (mimeType === 'video/mp4' || mimeType === 'image/gif') {
-            stickerConfig.type = 'full'; // full permite stickers animados
+            stickerConfig.type = 'full';
         }
-
         const sticker = new Sticker(buffer, stickerConfig);
         return await sticker.toBuffer();
     } catch (error) {
@@ -318,7 +317,6 @@ async function createStickerFromMedia(buffer, mimeType) {
         return null;
     }
 }
-
 
 // ============ BUSCAR Y DESCARGAR APK DESDE APKPURE ============
 async function searchApkPure(appName) {
@@ -328,12 +326,10 @@ async function searchApkPure(appName) {
             headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
         });
         const $ = cheerio.load(data);
-        // Obtener primer enlace de resultado
         const firstLink = $('.search-results .first a').attr('href') || $('.search-results li:first-child a').attr('href');
         if (!firstLink) return null;
         const detailUrl = firstLink.startsWith('http') ? firstLink : `https://apkpure.net${firstLink}`;
         
-        // Obtener enlace de descarga desde la página del APK
         const { data: detailData } = await axios.get(detailUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
         const $$ = cheerio.load(detailData);
         let downloadLink = $$('.download-btn').attr('href') || $$('.da-download').attr('href');
@@ -357,7 +353,6 @@ async function downloadApk(url) {
         return null;
     }
 }
-
 
 function isLink(text) {
     const linkRegex = /(https?:\/\/[^\s]+|www\.[^\s]+|[a-zA-Z0-9-]+\.(com|mx|org|net|edu|gov|io|app|xyz|club|live|online))/i;
@@ -401,9 +396,6 @@ async function startBot() {
     
     sock.ev.on("creds.update", saveCreds);
     
-    // 👇 IMPORTANTE: el pairing se hace ANTES de que se conecte
-    // ============ EMPAREJAMIENTO AUTOMÁTICO (CORREGIDO PARA RAILWAY) ============
-// Esperar un poco a que el socket se estabilice
     await new Promise(resolve => setTimeout(resolve, 3000));
 
     const creds = state.creds;
@@ -417,7 +409,6 @@ async function startBot() {
         log(LOG_LEVELS.INFO, `📱 Usando número: ${phoneNumber}`);
         log(LOG_LEVELS.INFO, "📲 Solicitando código (esto puede tomar unos segundos)...");
 
-        // Función para reintentar si falla
         let code = null;
         let attempts = 0;
         const maxAttempts = 3;
@@ -425,9 +416,7 @@ async function startBot() {
         while (attempts < maxAttempts && !code) {
             attempts++;
             try {
-                // Esperar un poco más antes del primer intento (importante en Railway)
                 if (attempts > 1) await new Promise(resolve => setTimeout(resolve, 5000));
-                
                 code = await sock.requestPairingCode(phoneNumber);
                 log(LOG_LEVELS.SUCCESS, `\n✨ CÓDIGO: ${code}\n`);
                 log(LOG_LEVELS.INFO, "📱 Ve a WhatsApp > Dispositivos vinculados > Vincular con número de teléfono");
@@ -441,10 +430,7 @@ async function startBot() {
             }
         }
     }
-
-// El resto de tu código (eventos de conexión, etc.) sigue exactamente igual...
     
-    // Ahora sí, eventos de conexión
     sock.ev.on("connection.update", async (update) => {
         const { connection, lastDisconnect } = update;
         if (connection === "open") {
@@ -468,9 +454,7 @@ async function startBot() {
     });
 
     await ensureGifsFolder();
-
    
-    // Bienvenidas / despedidas
     sock.ev.on("group-participants.update", async (update) => {
         const { id, participants, action } = update;
         if (!BOT_CONFIG.welcomeEnabled && !BOT_CONFIG.goodbyeEnabled) return;
@@ -485,7 +469,6 @@ async function startBot() {
         if (message) await sock.sendMessage(id, { text: message });
     });
 
-    // Manejo de mensajes
     sock.ev.on("messages.upsert", async ({ messages }) => {
         const msg = messages[0];
         if (!msg.message || msg.key.fromMe) return;
@@ -495,7 +478,6 @@ async function startBot() {
         let text = getMessageText(msg);
         if (!text && !msg.message.imageMessage && !msg.message.videoMessage) return;
 
-        // Anti-spam
         if (isGroup && BOT_CONFIG.antiSpam && text) {
             if (isSpam(sender, text)) {
                 const warnKey = `${from}|${sender}`;
@@ -512,7 +494,6 @@ async function startBot() {
             }
         }
 
-        // Anti-enlaces
         if (isGroup && BOT_CONFIG.antiLink && text && isLink(text)) {
             try {
                 const groupMetadata = await sock.groupMetadata(from);
@@ -526,7 +507,6 @@ async function startBot() {
             } catch (err) {}
         }
 
-        // Verificar mute
         const muteKey = `${from}|${sender}`;
         const muteData = mutedUsers.get(muteKey);
         if (muteData && Date.now() < muteData) {
@@ -542,7 +522,6 @@ async function startBot() {
         const args = isCommand ? text.slice(BOT_CONFIG.prefix.length).trim().split(/\s+/) : [];
         const command = isCommand ? args.shift().toLowerCase() : null;
 
-        // Verificar admin de grupo
         let isAdmin = false, isSuperAdmin = false;
         if (isGroup) {
             try {
@@ -560,8 +539,7 @@ async function startBot() {
             return;
         }
 
-        // Sticker desde imagen
-// Sticker desde imagen, GIF o video (sin comando)
+        // Sticker automático (sin comando)
         if ((msg.message.imageMessage || msg.message.videoMessage) && !isCommand) {
             try {
                 let mediaBuffer, mimeType;
@@ -578,7 +556,6 @@ async function startBot() {
                     return;
                 }
 
-                // Verificar si es un formato soportado
                 const supportedMimes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'video/mp4'];
                 if (!supportedMimes.includes(mimeType)) {
                     await sock.sendMessage(from, { text: "❌ Formato no soportado. Usa JPG, PNG, GIF o MP4." });
@@ -607,17 +584,12 @@ async function startBot() {
             await sock.sendMessage(from, { text: `¡Hola ${senderName}! 😺 ¿Cómo estás?\n\nUsa ${BOT_CONFIG.prefix}menu para ver mis comandos.` });
         }
 
-
-
-        // ========== COMANDO !STICKER (para convertir multimedia respondiendo) ==========
         if (command === "sticker" || command === "s") {
             try {
-                // Verificar si se está respondiendo a un mensaje
                 const quotedMsg = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
                 let mediaBuffer, mimeType;
 
                 if (quotedMsg) {
-                    // Obtener el mensaje citado
                     if (quotedMsg.imageMessage) {
                         mediaBuffer = await sock.downloadMediaMessage({ message: quotedMsg });
                         mimeType = quotedMsg.imageMessage.mimetype;
@@ -629,7 +601,6 @@ async function startBot() {
                         return;
                     }
                 } else if (msg.message.imageMessage || msg.message.videoMessage) {
-                    // Si el comando se envía junto con el archivo (sin responder)
                     if (msg.message.imageMessage) {
                         mediaBuffer = await sock.downloadMediaMessage(msg);
                         mimeType = msg.message.imageMessage.mimetype;
@@ -667,7 +638,6 @@ async function startBot() {
             return;
         }
 
-
         if (command === "ping") {
             const start = Date.now();
             await sock.sendMessage(from, { text: "🏓 Calculando ping..." });
@@ -675,7 +645,7 @@ async function startBot() {
             await sock.sendMessage(from, { text: `🏓 Pong!\nLatencia: ${end - start}ms\n⏱️ ${new Date().toLocaleTimeString()}` });
         }
 
-        // ========== KISS (con menciones reales usando números) ==========
+        // ========== COMANDO KISS MODIFICADO (GIF NORMAL + TEXTO) ==========
         if (command === "kiss") {
             try {
                 let target = null, targetName = null;
@@ -716,9 +686,20 @@ async function startBot() {
                     kissMessage = `@${senderPhone} ${randomPhrase} con mucho cariño 💕`;
                     mentions.push(sender);
                 }
+                // Enviar texto
                 await sock.sendMessage(from, { text: kissMessage, mentions });
-                const stickerBuffer = await getRandomKissSticker();
-                if (stickerBuffer) await sock.sendMessage(from, { sticker: stickerBuffer });
+                
+                // Enviar GIF normal (no sticker)
+                const gifData = await getRandomKissGif();
+                if (gifData) {
+                    if (gifData.isGif) {
+                        // Enviar como imagen GIF
+                        await sock.sendMessage(from, { image: gifData.buffer, mimetype: 'image/gif' });
+                    } else if (gifData.isMp4) {
+                        // Enviar como video con reproducción tipo GIF
+                        await sock.sendMessage(from, { video: gifData.buffer, mimetype: 'video/mp4', gifPlayback: true });
+                    }
+                }
             } catch (error) {
                 log(LOG_LEVELS.ERROR, `Error en kiss: ${error}`);
                 await sock.sendMessage(from, { text: "❌ Error al procesar el comando !kiss" });
@@ -726,7 +707,6 @@ async function startBot() {
             return;
         }
 
-        // ========== MENÚ ==========
         // ========== MENÚ ==========
         if (command === "menu") {
             let menuText = `╔════════════════════════════════════╗\n`;
@@ -795,7 +775,6 @@ async function startBot() {
             await sock.sendMessage(from, { text: menuText });
         }
 
-
         // ========== COMANDOS DE GRUPO ==========
         if (isGroup) {
             if (command === "grupoinfo") {
@@ -818,9 +797,6 @@ async function startBot() {
                 } catch (err) { await sock.sendMessage(from, { text: "❌ Error obteniendo info del grupo" }); }
             }
 
-
-
-            // ========== COMANDO !APK ==========
             if (command === "apk") {
                 try {
                     const searchTerm = args.join(" ").trim();
@@ -864,7 +840,6 @@ async function startBot() {
                 return;
             }
 
-            // ========== COMANDO FRUTIFANTÁSTICO ==========
             if (command === "detonar" || command === "fruti") {
                 try {
                     let target = null;
@@ -912,7 +887,6 @@ async function startBot() {
                     
                     await sock.sendMessage(from, { text: frutiMessage, mentions });
                     
-                    // Reutilizar el sticker de explosión (si existe)
                     const stickerBuffer = await getRandomExplosionSticker();
                     if (stickerBuffer) {
                         await sock.sendMessage(from, { sticker: stickerBuffer });
@@ -994,7 +968,6 @@ async function startBot() {
                 }
             }
 
-            // ========== ADMINISTRACIÓN ==========
             if (!isAdmin && !["menu","hola","ping","kiss","grupoinfo","miembros","reglas","admin"].includes(command)) {
                 await sock.sendMessage(from, { text: "❌ Solo administradores pueden usar este comando." });
                 return;
@@ -1035,11 +1008,6 @@ async function startBot() {
                     await sock.sendMessage(from, { text: `🔇 @${phone} (${userName}) ha sido silenciado por ${durationText}.`, mentions: [user] });
                 }
             }
-
-
-            // ========== COMANDO FRUTIFANTÁSTICO ==========
-
-
 
             if (command === "unmute") {
                 let mentioned = getMentionedJids(msg);
@@ -1180,7 +1148,6 @@ async function startBot() {
             }
         }
 
-        // ========== COMANDOS PARA ADMINS DEL BOT ==========
         const isBotAdmin = BOT_CONFIG.admins.includes(sender.split('@')[0]);
         if (isBotAdmin && command === "broadcast") {
             const broadcastMsg = args.join(" ");
