@@ -417,15 +417,20 @@ async function startBot() {
     await ensureGifsFolder();
 
     const creds = state.creds;
+
     if (!creds.registered) {
         log(LOG_LEVELS.INFO, "\n📱 MODO DE EMPAREJAMIENTO CON CÓDIGO");
-        const phoneNumber = await question("🔢 Ingresa tu número con código de país (ej: 521234567890): ");
+
+        const phoneNumber = process.env.NUMERO;
+
         log(LOG_LEVELS.INFO, "📲 Solicitando código...");
+
         const code = await sock.requestPairingCode(phoneNumber);
+
         log(LOG_LEVELS.SUCCESS, `\n✨ CÓDIGO: ${code}\n`);
+
         log(LOG_LEVELS.INFO, "📱 WhatsApp > Dispositivos vinculados > Vincular con código");
     }
-
     // Bienvenidas / despedidas
     sock.ev.on("group-participants.update", async (update) => {
         const { id, participants, action } = update;
