@@ -416,17 +416,29 @@ async function startBot() {
         }
 
         if (connection === "close") {
-            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+
+            const creds = state.creds;
+
+            if (!creds.registered) {
+                log(LOG_LEVELS.WARNING, "Esperando generación de código...");
+                return;
+            }
+
+            const shouldReconnect =
+                lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+
             if (shouldReconnect && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+
                 reconnectAttempts++;
+
                 const waitTime = 5000 * reconnectAttempts;
-                log(LOG_LEVELS.WARNING, `Reconectando en ${waitTime/1000}s (Intento ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+
+                log(
+                    LOG_LEVELS.WARNING,
+                    `Reconectando en ${waitTime / 1000}s`
+                );
+
                 setTimeout(() => startBot(), waitTime);
-            } else if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-                log(LOG_LEVELS.ERROR, "Máximos intentos de reconexión alcanzados");
-                process.exit(1);
-            } else {
-                log(LOG_LEVELS.INFO, "Sesión cerrada voluntariamente");
             }
         }
     });
