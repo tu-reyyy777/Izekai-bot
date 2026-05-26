@@ -425,6 +425,8 @@ async function startBot() {
 
         log(LOG_LEVELS.INFO, "📲 Solicitando código...");
 
+        await new Promise(resolve => setTimeout(resolve, 10000));
+
         const code = await sock.requestPairingCode(phoneNumber);
 
         log(LOG_LEVELS.SUCCESS, `\n✨ CÓDIGO: ${code}\n`);
