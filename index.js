@@ -16,13 +16,14 @@ const { Sticker } = require('wa-sticker-formatter')
 const BOT_CONFIG = {
     prefix: "!",           
     botName: "Ize-Bot",
-    admins: [],            // Números de admin del bot: ["521234567890"]
+    admins: [],            
     onlyAdmins: false,     
     welcomeEnabled: true,  
     goodbyeEnabled: true,
     antiLink: false,       
     antiSpam: true,        
-    maxWarnings: 3         
+    maxWarnings: 3,
+    ownerNumber: "5491171124966"   // <--- REEMPLAZA CON TU NÚMERO REAL (código país + número, sin +)
 }
 
 // ============ BASE DE DATOS EN MEMORIA ============
@@ -387,74 +388,60 @@ async function startBot() {
     let reconnectAttempts = 0;
     const MAX_RECONNECT_ATTEMPTS = 5;
     const { state, saveCreds } = await useMultiFileAuthState("./session");
+    
     const sock = makeWASocket({
-    auth: state,
-    logger: P({ level: "silent" }),
-    printQRInTerminal: false,
-    browser: ['Ubuntu', 'Chrome', '20.0.04'],
-    syncFullHistory: false,
-    markOnlineOnConnect: true,
-    generateHighQualityLinkPreview: true
-});
+        auth: state,
+        logger: P({ level: "silent" }),
+        printQRInTerminal: false,
+        browser: ['Ubuntu', 'Chrome', '20.0.04'],
+        syncFullHistory: false,
+        markOnlineOnConnect: true,
+        generateHighQualityLinkPreview: true
+    });
+    
     sock.ev.on("creds.update", saveCreds);
-
+    
+    // 👇 IMPORTANTE: el pairing se hace ANTES de que se conecte
+    const creds = state.creds;
+    if (!creds.registered) {
+        log(LOG_LEVELS.INFO, "\n📱 MODO DE EMPAREJAMIENTO CON CÓDIGO");
+        const phoneNumber = BOT_CONFIG.ownerNumber;  // Usa el número fijo
+        if (!phoneNumber) {
+            log(LOG_LEVELS.ERROR, "❌ Define BOT_CONFIG.ownerNumber con tu número");
+            process.exit(1);
+        }
+        log(LOG_LEVELS.INFO, `📱 Usando número: ${phoneNumber}`);
+        log(LOG_LEVELS.INFO, "📲 Solicitando código...");
+        
+        try {
+            const code = await sock.requestPairingCode(phoneNumber);
+            log(LOG_LEVELS.SUCCESS, `\n✨ CÓDIGO: ${code}\n`);
+            log(LOG_LEVELS.INFO, "📱 WhatsApp > Dispositivos vinculados > Vincular con código");
+        } catch (err) {
+            log(LOG_LEVELS.ERROR, `Error generando código: ${err}`);
+            process.exit(1);
+        }
+    }
+    
+    // Ahora sí, eventos de conexión
     sock.ev.on("connection.update", async (update) => {
         const { connection, lastDisconnect } = update;
         if (connection === "open") {
-
             reconnectAttempts = 0;
-
             log(LOG_LEVELS.SUCCESS, `${BOT_CONFIG.botName} conectado exitosamente 😺`);
-
-            const creds = state.creds;
-
-            if (!creds.registered) {
-
-                log(LOG_LEVELS.INFO, "\n📱 MODO DE EMPAREJAMIENTO CON CÓDIGO");
-
-                const phoneNumber = process.env.NUMERO;
-
-                await new Promise(resolve => setTimeout(resolve, 5000));
-
-                try {
-
-                    const code = await sock.requestPairingCode(phoneNumber);
-
-                    log(LOG_LEVELS.SUCCESS, `\n✨ CÓDIGO: ${code}\n`);
-
-                } catch (err) {
-
-                    log(LOG_LEVELS.ERROR, `Error generando código: ${err}`);
-
-                }
-            }
         }
-
-
         if (connection === "close") {
-
-            const creds = state.creds;
-
-            if (!creds.registered) {
-                log(LOG_LEVELS.WARNING, "Esperando generación de código...");
-                return;
-            }
-
-            const shouldReconnect =
-                lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-
+            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
             if (shouldReconnect && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
-
                 reconnectAttempts++;
-
                 const waitTime = 5000 * reconnectAttempts;
-
-                log(
-                    LOG_LEVELS.WARNING,
-                    `Reconectando en ${waitTime / 1000}s`
-                );
-
+                log(LOG_LEVELS.WARNING, `Reconectando en ${waitTime/1000}s (Intento ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
                 setTimeout(() => startBot(), waitTime);
+            } else if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+                log(LOG_LEVELS.ERROR, "Máximos intentos de reconexión alcanzados");
+                process.exit(1);
+            } else {
+                log(LOG_LEVELS.INFO, "Sesión cerrada voluntariamente");
             }
         }
     });
