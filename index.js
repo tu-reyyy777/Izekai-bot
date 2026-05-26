@@ -402,26 +402,47 @@ async function startBot() {
     sock.ev.on("creds.update", saveCreds);
     
     // 👇 IMPORTANTE: el pairing se hace ANTES de que se conecte
+    // ============ EMPAREJAMIENTO AUTOMÁTICO (CORREGIDO PARA RAILWAY) ============
+// Esperar un poco a que el socket se estabilice
+    await new Promise(resolve => setTimeout(resolve, 3000));
+
     const creds = state.creds;
     if (!creds.registered) {
         log(LOG_LEVELS.INFO, "\n📱 MODO DE EMPAREJAMIENTO CON CÓDIGO");
-        const phoneNumber = BOT_CONFIG.ownerNumber;  // Usa el número fijo
+        const phoneNumber = BOT_CONFIG.ownerNumber;
         if (!phoneNumber) {
-            log(LOG_LEVELS.ERROR, "❌ Define BOT_CONFIG.ownerNumber con tu número");
+            log(LOG_LEVELS.ERROR, "❌ Define BOT_CONFIG.ownerNumber con tu número (código país + número, sin +)");
             process.exit(1);
         }
         log(LOG_LEVELS.INFO, `📱 Usando número: ${phoneNumber}`);
-        log(LOG_LEVELS.INFO, "📲 Solicitando código...");
-        
-        try {
-            const code = await sock.requestPairingCode(phoneNumber);
-            log(LOG_LEVELS.SUCCESS, `\n✨ CÓDIGO: ${code}\n`);
-            log(LOG_LEVELS.INFO, "📱 WhatsApp > Dispositivos vinculados > Vincular con código");
-        } catch (err) {
-            log(LOG_LEVELS.ERROR, `Error generando código: ${err}`);
-            process.exit(1);
+        log(LOG_LEVELS.INFO, "📲 Solicitando código (esto puede tomar unos segundos)...");
+
+        // Función para reintentar si falla
+        let code = null;
+        let attempts = 0;
+        const maxAttempts = 3;
+
+        while (attempts < maxAttempts && !code) {
+            attempts++;
+            try {
+                // Esperar un poco más antes del primer intento (importante en Railway)
+                if (attempts > 1) await new Promise(resolve => setTimeout(resolve, 5000));
+                
+                code = await sock.requestPairingCode(phoneNumber);
+                log(LOG_LEVELS.SUCCESS, `\n✨ CÓDIGO: ${code}\n`);
+                log(LOG_LEVELS.INFO, "📱 Ve a WhatsApp > Dispositivos vinculados > Vincular con número de teléfono");
+                log(LOG_LEVELS.INFO, "📱 Ingresa el código de 8 dígitos que ves arriba.\n");
+            } catch (err) {
+                log(LOG_LEVELS.ERROR, `Intento ${attempts}/${maxAttempts} falló: ${err.message}`);
+                if (attempts === maxAttempts) {
+                    log(LOG_LEVELS.ERROR, "No se pudo generar el código después de varios intentos.");
+                    process.exit(1);
+                }
+            }
         }
     }
+
+// El resto de tu código (eventos de conexión, etc.) sigue exactamente igual...
     
     // Ahora sí, eventos de conexión
     sock.ev.on("connection.update", async (update) => {
