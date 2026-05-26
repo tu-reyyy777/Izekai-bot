@@ -404,9 +404,17 @@ async function startBot() {
 
                 await new Promise(resolve => setTimeout(resolve, 8000));
 
-                const code = await sock.requestPairingCode(phoneNumber);
+                try {
 
-                log(LOG_LEVELS.SUCCESS, `\n✨ CÓDIGO: ${code}\n`);
+                    const code = await sock.requestPairingCode(phoneNumber);
+
+                    log(LOG_LEVELS.SUCCESS, `\n✨ CÓDIGO: ${code}\n`);
+
+                } catch (err) {
+
+                    log(LOG_LEVELS.ERROR, `Error generando código: ${err}`);
+
+                }
             }
         }
 
