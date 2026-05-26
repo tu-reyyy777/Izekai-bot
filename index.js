@@ -561,44 +561,6 @@ async function startBot() {
         }
 
         // Sticker desde imagen
-// Sticker desde imagen, GIF o video (sin comando)
-        if ((msg.message.imageMessage || msg.message.videoMessage) && !isCommand) {
-            try {
-                let mediaBuffer, mimeType;
-                if (msg.message.imageMessage) {
-                    mediaBuffer = await sock.downloadMediaMessage(msg);
-                    mimeType = msg.message.imageMessage.mimetype;
-                } else if (msg.message.videoMessage) {
-                    mediaBuffer = await sock.downloadMediaMessage(msg);
-                    mimeType = msg.message.videoMessage.mimetype;
-                }
-                
-                if (!mediaBuffer) {
-                    await sock.sendMessage(from, { text: "❌ No se pudo descargar el archivo." });
-                    return;
-                }
-
-                // Verificar si es un formato soportado
-                const supportedMimes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'video/mp4'];
-                if (!supportedMimes.includes(mimeType)) {
-                    await sock.sendMessage(from, { text: "❌ Formato no soportado. Usa JPG, PNG, GIF o MP4." });
-                    return;
-                }
-
-                const stickerBuffer = await createStickerFromMedia(mediaBuffer, mimeType);
-                if (stickerBuffer) {
-                    await sock.sendMessage(from, { sticker: stickerBuffer });
-                    log(LOG_LEVELS.SUCCESS, `Sticker creado desde ${mimeType}`);
-                } else {
-                    await sock.sendMessage(from, { text: "❌ Error al crear el sticker. Intenta con otro archivo." });
-                }
-            } catch (error) {
-                log(LOG_LEVELS.ERROR, `Error en sticker automático: ${error}`);
-                await sock.sendMessage(from, { text: "❌ Error al procesar el archivo." });
-            }
-            return;
-        }
-        if (!isCommand) return;
 
         // ==================== COMANDOS ====================
 
