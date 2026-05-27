@@ -238,7 +238,7 @@ async function ensureGifsFolder() {
     }
 }
 
-async function getRandomKissSticker() {
+async function getRandomKissGif() {
     try {
         const gifsDir = path.join(__dirname, 'gifs');
         if (!fs.existsSync(gifsDir)) return null;
@@ -246,11 +246,9 @@ async function getRandomKissSticker() {
         const gifFiles = files.filter(f => f.endsWith('.gif') || f.endsWith('.mp4') || f.endsWith('.webp'));
         if (gifFiles.length === 0) return null;
         const randomGif = gifFiles[Math.floor(Math.random() * gifFiles.length)];
-        const gifBuffer = fs.readFileSync(path.join(gifsDir, randomGif));
-        const sticker = new Sticker(gifBuffer, { pack: BOT_CONFIG.botName, author: 'Kisses 💋', type: 'full', quality: 80 });
-        return await sticker.toBuffer();
+        return fs.readFileSync(path.join(gifsDir, randomGif));
     } catch (error) {
-        log(LOG_LEVELS.ERROR, `Error creando sticker: ${error}`);
+        log(LOG_LEVELS.ERROR, `Error obteniendo GIF de beso: ${error}`);
         return null;
     }
 }
@@ -637,7 +635,6 @@ async function startBot() {
             await sock.sendMessage(from, { text: `🏓 Pong!\nLatencia: ${end - start}ms\n⏱️ ${new Date().toLocaleTimeString()}` });
         }
 
-        // ========== KISS (con menciones reales usando números) ==========
         if (command === "kiss") {
             try {
                 let target = null, targetName = null;
@@ -678,9 +675,21 @@ async function startBot() {
                     kissMessage = `@${senderPhone} ${randomPhrase} con mucho cariño 💕`;
                     mentions.push(sender);
                 }
-                await sock.sendMessage(from, { text: kissMessage, mentions });
-                const stickerBuffer = await getRandomKissSticker();
-                if (stickerBuffer) await sock.sendMessage(from, { sticker: stickerBuffer });
+
+                // Obtener GIF de beso
+                const gifBuffer = await getRandomKissGif();
+                if (gifBuffer) {
+                    // Enviar como GIF normal con texto en caption
+                    await sock.sendMessage(from, {
+                        video: gifBuffer,
+                        gifPlayback: true,
+                        caption: kissMessage,
+                        mentions: mentions
+                    });
+                } else {
+                    // Si no hay GIFs, enviar solo el texto
+                    await sock.sendMessage(from, { text: kissMessage, mentions });
+                }
             } catch (error) {
                 log(LOG_LEVELS.ERROR, `Error en kiss: ${error}`);
                 await sock.sendMessage(from, { text: "❌ Error al procesar el comando !kiss" });
@@ -688,8 +697,6 @@ async function startBot() {
             return;
         }
 
-        // ========== MENÚ ==========
-        // ========== MENÚ ==========
         if (command === "menu") {
             let menuText = `╔════════════════════════════════════╗\n`;
             menuText += `║           ✨ ${BOT_CONFIG.botName} ✨           ║\n`;
