@@ -1,35 +1,47 @@
-<const {
+const {
     default: makeWASocket,
     useMultiFileAuthState,
     DisconnectReason
-} = require("@whiskeysockets/baileys")
+} = require("@whiskeysockets/baileys");
 
-const P = require("pino")
-const readline = require("readline")
-const fs = require('fs')
-const path = require('path')
+const P = require("pino");
+const readline = require("readline");
+const fs = require('fs');
+const path = require('path');
 const axios = require('axios');
 const cheerio = require('cheerio');
-const { Sticker } = require('wa-sticker-formatter')
+const { Sticker } = require('wa-sticker-formatter');
 
 // ============ CONFIGURACIÓN ============
 const BOT_CONFIG = {
-    prefix: "!",           
+    prefix: "!",
     botName: "Ize-Bot",
-    admins: [],            
-    onlyAdmins: false,     
-    welcomeEnabled: true,  
-    goodbyeEnabled: true,
-    antiLink: false,       
-    antiSpam: true,        
+    ownerNumber: "5491171124966",   // NÚMERO DEL DUEÑO (sin +)
     maxWarnings: 3,
-    ownerNumber: "5491171124966"   // <--- REEMPLAZA CON TU NÚMERO REAL (código país + número, sin +)
+    antiSpamCooldown: 10000,        // 10 segundos para considerar spam
+    maxMessagesInWindow: 5,
+    persistenceFile: "./bot_data.json"
+};
+
+// ============ DATOS PERSISTENTES ============
+let botData = {
+    warnings: {},        // "groupId|userId" -> number
+    mutedUsers: {},      // "groupId|userId" -> timestamp expiración
+    groupSettings: {}    // groupId -> { antiLink, antiSpam, welcomeEnabled, goodbyeEnabled }
+};
+
+function loadData() {
+    if (fs.existsSync(BOT_CONFIG.persistenceFile)) {
+        try {
+            const raw = fs.readFileSync(BOT_CONFIG.persistenceFile);
+            botData = JSON.parse(raw);
+        } catch(e) { console.error("Error cargando datos:", e); }
+    }
 }
 
-// ============ BASE DE DATOS EN MEMORIA ============
-const warnings = new Map();
-const mutedUsers = new Map();
-const spamTracker = new Map();
+function saveData() {
+    fs.writeFileSync(BOT_CONFIG.persistenceFile, JSON.stringify(botData, null, 2));
+}
 
 // ============ SISTEMA DE LOGS ============
 const LOG_LEVELS = {
@@ -39,7 +51,7 @@ const LOG_LEVELS = {
     WARNING: '⚠️',
     BOT: '🤖',
     ADMIN: '👑'
-}
+};
 
 function log(level, message) {
     const timestamp = new Date().toLocaleTimeString();
@@ -51,265 +63,188 @@ const question = (text) => {
     const rl = readline.createInterface({
         input: process.stdin,
         output: process.stdout
-    })
+    });
     return new Promise((resolve) => {
         rl.question(text, (answer) => {
-            rl.close()
-            resolve(answer)
-        })
-    })
-}
+            rl.close();
+            resolve(answer);
+        });
+    });
+};
 
 // ============ FUNCIONES PARA MENSAJES ============
 function getMessageText(msg) {
-    if (msg.message?.conversation) {
-        return msg.message.conversation;
-    }
-    if (msg.message?.extendedTextMessage?.text) {
-        return msg.message.extendedTextMessage.text;
-    }
-    if (msg.message?.imageMessage?.caption) {
-        return msg.message.imageMessage.caption;
-    }
-    if (msg.message?.videoMessage?.caption) {
-        return msg.message.videoMessage.caption;
-    }
-    if (msg.message?.buttonsResponseMessage?.selectedButtonId) {
-        return msg.message.buttonsResponseMessage.selectedButtonId;
-    }
-    if (msg.message?.listResponseMessage?.singleSelectReply?.selectedRowId) {
-        return msg.message.listResponseMessage.singleSelectReply.selectedRowId;
-    }
+    if (msg.message?.conversation) return msg.message.conversation;
+    if (msg.message?.extendedTextMessage?.text) return msg.message.extendedTextMessage.text;
+    if (msg.message?.imageMessage?.caption) return msg.message.imageMessage.caption;
+    if (msg.message?.videoMessage?.caption) return msg.message.videoMessage.caption;
+    if (msg.message?.buttonsResponseMessage?.selectedButtonId) return msg.message.buttonsResponseMessage.selectedButtonId;
+    if (msg.message?.listResponseMessage?.singleSelectReply?.selectedRowId) return msg.message.listResponseMessage.singleSelectReply.selectedRowId;
     return null;
 }
 
 function getQuotedMessageSender(msg) {
-    if (msg.message?.extendedTextMessage?.contextInfo?.participant) {
-        return msg.message.extendedTextMessage.contextInfo.participant;
-    }
-    if (msg.message?.imageMessage?.contextInfo?.participant) {
-        return msg.message.imageMessage.contextInfo.participant;
-    }
-    if (msg.message?.videoMessage?.contextInfo?.participant) {
-        return msg.message.videoMessage.contextInfo.participant;
-    }
-    return null;
+    return msg.message?.extendedTextMessage?.contextInfo?.participant ||
+           msg.message?.imageMessage?.contextInfo?.participant ||
+           msg.message?.videoMessage?.contextInfo?.participant ||
+           null;
 }
 
 function getQuotedMessageId(msg) {
-    if (msg.message?.extendedTextMessage?.contextInfo?.stanzaId) {
-        return msg.message.extendedTextMessage.contextInfo.stanzaId;
-    }
-    if (msg.message?.imageMessage?.contextInfo?.stanzaId) {
-        return msg.message.imageMessage.contextInfo.stanzaId;
-    }
-    if (msg.message?.videoMessage?.contextInfo?.stanzaId) {
-        return msg.message.videoMessage.contextInfo.stanzaId;
-    }
-    return null;
+    return msg.message?.extendedTextMessage?.contextInfo?.stanzaId ||
+           msg.message?.imageMessage?.contextInfo?.stanzaId ||
+           msg.message?.videoMessage?.contextInfo?.stanzaId ||
+           null;
 }
 
-// ============ FUNCIÓN PARA OBTENER NOMBRE MOSTRADO ============
+// ============ CACHÉ DE METADATOS DE GRUPO ============
+const groupMetadataCache = new Map();
+
+async function getGroupMetadataCached(sock, groupId) {
+    if (groupMetadataCache.has(groupId)) {
+        return groupMetadataCache.get(groupId);
+    }
+    const metadata = await sock.groupMetadata(groupId);
+    groupMetadataCache.set(groupId, metadata);
+    return metadata;
+}
+
+function invalidateGroupCache(groupId) {
+    groupMetadataCache.delete(groupId);
+}
+
+// ============ OBTENER NOMBRE MOSTRADO ============
 async function getDisplayName(sock, jid) {
     try {
+        const cleanJid = jid.split('@')[0] + '@s.whatsapp.net';
         if (sock.store?.contacts) {
-            for (const [contactId, contactData] of Object.entries(sock.store.contacts)) {
-                if (contactId === jid || contactData.id === jid) {
-                    const name = contactData.name || contactData.notify || contactData.verifiedName;
-                    if (name && name !== jid) return name;
+            for (const contact of Object.values(sock.store.contacts)) {
+                if (contact.id === cleanJid) {
+                    return contact.name || contact.notify || contact.verifiedName || "Usuario";
                 }
             }
         }
-        if (sock.contacts && sock.contacts[jid]) {
-            const name = sock.contacts[jid].name || sock.contacts[jid].notify;
-            if (name) return name;
-        }
-        const number = jid.split('@')[0];
-        if (number && /^\d+$/.test(number) && number.length >= 8) {
-            return number.slice(-8);
-        }
+        const number = cleanJid.split('@')[0];
+        if (number.length >= 8) return number.slice(-8);
         return "Usuario";
-    } catch (err) {
+    } catch {
         return "Usuario";
     }
 }
 
-// ============ BUSCAR USUARIO POR NOMBRE EN EL GRUPO ============
-async function findUserByName(sock, groupId, searchName) {
+// ============ VERIFICAR ADMINISTRADOR ============
+async function isUserAdmin(sock, groupId, userId) {
     try {
-        let cleanSearch = searchName.toLowerCase().trim();
-        if (cleanSearch.startsWith('@')) cleanSearch = cleanSearch.substring(1);
-        
-        const groupMetadata = await sock.groupMetadata(groupId);
-        const participants = groupMetadata.participants;
-        console.log(`🔍 Buscando usuario: "${cleanSearch}"`);
-        
-        const userMap = [];
-        for (const participant of participants) {
-            const jid = participant.id;
-            let userName = await getDisplayName(sock, jid);
-            userMap.push({ jid, name: userName.toLowerCase(), originalName: userName });
-        }
-        
-        for (const user of userMap) if (user.name === cleanSearch) return user.jid;
-        for (const user of userMap) if (user.name.includes(cleanSearch)) return user.jid;
-        
-        const searchWords = cleanSearch.split(/\s+/);
-        for (const user of userMap) {
-            for (const word of searchWords) {
-                if (word.length >= 2 && user.name.includes(word)) return user.jid;
-            }
-        }
-        console.log(`❌ No encontrado: "${cleanSearch}"`);
-        return null;
-    } catch (error) {
-        console.error('Error en findUserByName:', error);
-        return null;
+        const metadata = await getGroupMetadataCached(sock, groupId);
+        const participant = metadata.participants.find(p => p.id === userId);
+        return participant && (participant.admin === "admin" || participant.admin === "superadmin");
+    } catch {
+        return false;
     }
 }
 
-// ============ OBTENER MENCIONES AVANZADAS ============
-async function getMentionedUsersAdvanced(sock, msg, from, isGroup) {
-    const mentionedJids = [];
-    
-    if (msg.message?.extendedTextMessage?.contextInfo?.mentionedJid) {
-        const mentions = msg.message.extendedTextMessage.contextInfo.mentionedJid;
-        if (Array.isArray(mentions) && mentions.length > 0) return mentions;
-    }
-    
-    if (msg.message?.extendedTextMessage?.contextInfo?.participant) {
-        const participant = msg.message.extendedTextMessage.contextInfo.participant;
-        if (participant) return [participant];
-    }
-    
-    if (isGroup) {
-        const text = getMessageText(msg);
-        if (text) {
-            const mentionRegex = /@([a-zA-ZáéíóúñÑüÁÉÍÓÚÜ0-9\s]+)/g;
-            let match;
-            while ((match = mentionRegex.exec(text)) !== null) {
-                let searchName = match[1].trim().replace(/[^\w\sáéíóúüñ]/gi, '');
-                if (searchName && searchName.length >= 2) {
-                    const userJid = await findUserByName(sock, from, searchName);
-                    if (userJid && !mentionedJids.includes(userJid)) mentionedJids.push(userJid);
-                }
+// ============ ANTI-SPAM CON VENTANA DESLIZANTE ============
+const spamTracker = new Map(); // userId -> array de timestamps
+
+function isSpam(userId) {
+    const now = Date.now();
+    let timestamps = spamTracker.get(userId) || [];
+    // Conservar solo mensajes dentro de la ventana de tiempo
+    timestamps = timestamps.filter(ts => now - ts < BOT_CONFIG.antiSpamCooldown);
+    timestamps.push(now);
+    spamTracker.set(userId, timestamps);
+    // Limpiar usuarios inactivos cada minuto
+    if (Math.random() < 0.01) {
+        for (let [uid, tsArray] of spamTracker.entries()) {
+            if (tsArray.length === 0 || now - tsArray[tsArray.length-1] > 60000) {
+                spamTracker.delete(uid);
             }
         }
     }
-    return mentionedJids;
+    return timestamps.length > BOT_CONFIG.maxMessagesInWindow;
 }
 
-// ============ FUNCIÓN PARA OBTENER NOMBRE (CON PUSHNAME) ============
-async function getContactName(sock, jid, msg = null) {
-    try {
-        if (msg && msg.pushName) return msg.pushName;
-        let cleanJid = jid.includes('@') ? jid : jid + '@s.whatsapp.net';
-        if (sock.store?.contacts) {
-            for (const [contactId, contactData] of Object.entries(sock.store.contacts)) {
-                if (contactId === cleanJid || contactData.id === cleanJid) {
-                    const name = contactData.name || contactData.notify || contactData.verifiedName;
-                    if (name && name !== cleanJid) return name;
-                }
-            }
-        }
-        let phoneNumber = cleanJid.split('@')[0];
-        if (/^\d{10,15}$/.test(phoneNumber)) {
-            if (sock.getName) {
-                const name = await sock.getName(cleanJid);
-                if (name && name !== phoneNumber) return name;
-            }
-        }
-        if (phoneNumber.length === 10) return `${phoneNumber.slice(0,3)}-${phoneNumber.slice(3,6)}-${phoneNumber.slice(6)}`;
-        if (phoneNumber.length === 11) return `${phoneNumber.slice(0,2)}-${phoneNumber.slice(2,5)}-${phoneNumber.slice(5,8)}-${phoneNumber.slice(8)}`;
-        if (phoneNumber.length >= 8) return phoneNumber.slice(-8);
-        return "Usuario";
-    } catch (err) {
-        return "Usuario";
-    }
+// ============ VERIFICAR ENLACES ============
+function isLink(text) {
+    const linkRegex = /(https?:\/\/[^\s]+|www\.[^\s]+|[a-zA-Z0-9-]+\.(com|mx|org|net|edu|gov|io|app|xyz|club|live|online))/i;
+    return linkRegex.test(text);
 }
 
-// ============ VERIFICAR CARPETA DE GIFS ============
+// ============ CONFIGURACIÓN POR GRUPO ============
+function getGroupSetting(groupId, setting) {
+    if (!botData.groupSettings[groupId]) {
+        botData.groupSettings[groupId] = {
+            antiLink: false,
+            antiSpam: true,
+            welcomeEnabled: true,
+            goodbyeEnabled: true
+        };
+    }
+    return botData.groupSettings[groupId][setting];
+}
+
+function setGroupSetting(groupId, setting, value) {
+    if (!botData.groupSettings[groupId]) {
+        botData.groupSettings[groupId] = {
+            antiLink: false,
+            antiSpam: true,
+            welcomeEnabled: true,
+            goodbyeEnabled: true
+        };
+    }
+    botData.groupSettings[groupId][setting] = value;
+    saveData();
+}
+
+// ============ FUNCIONES PARA GIFS Y STICKERS ============
 async function ensureGifsFolder() {
     const gifsDir = path.join(__dirname, 'gifs');
     if (!fs.existsSync(gifsDir)) {
         fs.mkdirSync(gifsDir);
         log(LOG_LEVELS.WARNING, 'Carpeta "gifs" creada. Agrega GIFs de besos allí.');
-        fs.writeFileSync(path.join(gifsDir, 'README.txt'), 'Agrega aquí tus GIFs de besos anime.\nFormatos soportados: .gif, .mp4, .webp\nEl bot los usará automáticamente para el comando !kiss');
+        fs.writeFileSync(path.join(gifsDir, 'README.txt'), 'Agrega aquí tus GIFs de besos anime.\nFormatos soportados: .gif, .mp4, .webp');
     }
 }
 
 async function getRandomKissGif() {
-    try {
-        const gifsDir = path.join(__dirname, 'gifs');
-        if (!fs.existsSync(gifsDir)) return null;
-        const files = fs.readdirSync(gifsDir);
-        const gifFiles = files.filter(f => f.endsWith('.gif') || f.endsWith('.mp4') || f.endsWith('.webp'));
-        if (gifFiles.length === 0) return null;
-        const randomGif = gifFiles[Math.floor(Math.random() * gifFiles.length)];
-        return fs.readFileSync(path.join(gifsDir, randomGif));
-    } catch (error) {
-        log(LOG_LEVELS.ERROR, `Error obteniendo GIF de beso: ${error}`);
-        return null;
-    }
+    const gifsDir = path.join(__dirname, 'gifs');
+    if (!fs.existsSync(gifsDir)) return null;
+    const files = fs.readdirSync(gifsDir);
+    const gifFiles = files.filter(f => f.endsWith('.gif') || f.endsWith('.mp4') || f.endsWith('.webp'));
+    if (gifFiles.length === 0) return null;
+    const randomGif = gifFiles[Math.floor(Math.random() * gifFiles.length)];
+    return fs.readFileSync(path.join(gifsDir, randomGif));
 }
 
-
-// ============ OBTENER STICKER DE EXPLOSIÓN ============
 async function getRandomExplosionSticker() {
-    try {
-        const explosionsDir = path.join(__dirname, 'explosions');
-        
-        // Crear carpeta si no existe (opcional, para que el usuario sepa dónde poner sus stickers)
-        if (!fs.existsSync(explosionsDir)) {
-            fs.mkdirSync(explosionsDir);
-            log(LOG_LEVELS.WARNING, 'Carpeta "explosions" creada. Agrega ahí stickers/GIFs de explosiones.');
-            // Crear README informativo
-            fs.writeFileSync(path.join(explosionsDir, 'README.txt'), 
-                'Agrega aquí tus stickers/GIFs de explosiones para el comando !detonar.\n' +
-                'Formatos soportados: .gif, .mp4, .webp\n' +
-                'Si la carpeta está vacía, se usará un sticker de respaldo (URL).'
-            );
-            return null;
-        }
-        
-        const files = fs.readdirSync(explosionsDir);
-        const mediaFiles = files.filter(f => f.endsWith('.gif') || f.endsWith('.mp4') || f.endsWith('.webp'));
-        
-        if (mediaFiles.length === 0) return null;
-        
-        const randomFile = mediaFiles[Math.floor(Math.random() * mediaFiles.length)];
-        const fileBuffer = fs.readFileSync(path.join(explosionsDir, randomFile));
-        
-        const sticker = new Sticker(fileBuffer, {
-            pack: BOT_CONFIG.botName,
-            author: 'detonacion',
-            type: 'full',
-            quality: 80
-        });
-        
-        return await sticker.toBuffer();
-    } catch (error) {
-        log(LOG_LEVELS.ERROR, `Error en getRandomExplosionSticker: ${error}`);
+    const explosionsDir = path.join(__dirname, 'explosions');
+    if (!fs.existsSync(explosionsDir)) {
+        fs.mkdirSync(explosionsDir);
+        fs.writeFileSync(path.join(explosionsDir, 'README.txt'), 'Agrega aquí stickers/GIFs de explosiones.');
         return null;
     }
+    const files = fs.readdirSync(explosionsDir);
+    const mediaFiles = files.filter(f => f.endsWith('.gif') || f.endsWith('.mp4') || f.endsWith('.webp'));
+    if (mediaFiles.length === 0) return null;
+    const randomFile = mediaFiles[Math.floor(Math.random() * mediaFiles.length)];
+    const fileBuffer = fs.readFileSync(path.join(explosionsDir, randomFile));
+    const sticker = new Sticker(fileBuffer, {
+        pack: BOT_CONFIG.botName,
+        author: '💥',
+        type: 'full',
+        quality: 80
+    });
+    return await sticker.toBuffer();
 }
 
 async function createStickerFromMedia(buffer, mimeType) {
     try {
-        // Configuración básica del sticker
-        const stickerConfig = {
+        const sticker = new Sticker(buffer, {
             pack: BOT_CONFIG.botName,
             author: 'Sticker Bot',
-            type: 'full',
+            type: (mimeType === 'video/mp4' || mimeType === 'image/gif') ? 'full' : 'full',
             quality: 80
-        };
-
-        // Si es un video (mp4) o GIF, lo tratamos como sticker animado
-        if (mimeType === 'video/mp4' || mimeType === 'image/gif') {
-            stickerConfig.type = 'full'; // full permite stickers animados
-        }
-
-        const sticker = new Sticker(buffer, stickerConfig);
+        });
         return await sticker.toBuffer();
     } catch (error) {
         log(LOG_LEVELS.ERROR, `Error en createStickerFromMedia: ${error}`);
@@ -317,27 +252,20 @@ async function createStickerFromMedia(buffer, mimeType) {
     }
 }
 
-
-// ============ BUSCAR Y DESCARGAR APK DESDE APKPURE ============
+// ============ DESCARGA DE APKS (APKPURE) ============
 async function searchApkPure(appName) {
     try {
         const searchUrl = `https://apkpure.net/search?q=${encodeURIComponent(appName)}`;
-        const { data } = await axios.get(searchUrl, {
-            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
-        });
+        const { data } = await axios.get(searchUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
         const $ = cheerio.load(data);
-        // Obtener primer enlace de resultado
         const firstLink = $('.search-results .first a').attr('href') || $('.search-results li:first-child a').attr('href');
         if (!firstLink) return null;
         const detailUrl = firstLink.startsWith('http') ? firstLink : `https://apkpure.net${firstLink}`;
-        
-        // Obtener enlace de descarga desde la página del APK
         const { data: detailData } = await axios.get(detailUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
         const $$ = cheerio.load(detailData);
         let downloadLink = $$('.download-btn').attr('href') || $$('.da-download').attr('href');
         if (!downloadLink) return null;
         if (!downloadLink.startsWith('http')) downloadLink = `https://apkpure.net${downloadLink}`;
-        
         const apkName = $$('h1.title').text().trim() || appName;
         return { downloadUrl: downloadLink, name: apkName };
     } catch (error) {
@@ -356,93 +284,50 @@ async function downloadApk(url) {
     }
 }
 
-
-function isLink(text) {
-    const linkRegex = /(https?:\/\/[^\s]+|www\.[^\s]+|[a-zA-Z0-9-]+\.(com|mx|org|net|edu|gov|io|app|xyz|club|live|online))/i;
-    return linkRegex.test(text);
-}
-
-function isSpam(userId, message) {
-    if (!BOT_CONFIG.antiSpam) return false;
-    const now = Date.now();
-    const userData = spamTracker.get(userId);
-    if (!userData) {
-        spamTracker.set(userId, { count: 1, lastMessage: now, lastContent: message });
-        return false;
-    }
-    const timeDiff = now - userData.lastMessage;
-    if (timeDiff < 3000) {
-        userData.count++;
-        spamTracker.set(userId, { ...userData, lastMessage: now });
-        return userData.count >= 5;
-    } else {
-        spamTracker.set(userId, { count: 1, lastMessage: now, lastContent: message });
-        return false;
-    }
-}
-
 // ============ FUNCIÓN PRINCIPAL ============
 async function startBot() {
+    loadData();
     let reconnectAttempts = 0;
     const MAX_RECONNECT_ATTEMPTS = 5;
     const { state, saveCreds } = await useMultiFileAuthState("./session");
-    
+
     const sock = makeWASocket({
         auth: state,
         logger: P({ level: "silent" }),
         printQRInTerminal: false,
         browser: ['Ubuntu', 'Chrome', '20.0.04'],
         syncFullHistory: false,
-        markOnlineOnConnect: true,
-        generateHighQualityLinkPreview: true
+        markOnlineOnConnect: true
     });
-    
-    sock.ev.on("creds.update", saveCreds);
-    
-    // 👇 IMPORTANTE: el pairing se hace ANTES de que se conecte
-    // ============ EMPAREJAMIENTO AUTOMÁTICO (CORREGIDO PARA RAILWAY) ============
-// Esperar un poco a que el socket se estabilice
-    await new Promise(resolve => setTimeout(resolve, 3000));
 
-    const creds = state.creds;
-    if (!creds.registered) {
-        log(LOG_LEVELS.INFO, "\n📱 MODO DE EMPAREJAMIENTO CON CÓDIGO");
+    sock.ev.on("creds.update", saveCreds);
+
+    // Emparejamiento automático si no hay credenciales
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    if (!state.creds.registered) {
         const phoneNumber = BOT_CONFIG.ownerNumber;
         if (!phoneNumber) {
-            log(LOG_LEVELS.ERROR, "❌ Define BOT_CONFIG.ownerNumber con tu número (código país + número, sin +)");
+            log(LOG_LEVELS.ERROR, "❌ Define BOT_CONFIG.ownerNumber con tu número");
             process.exit(1);
         }
-        log(LOG_LEVELS.INFO, `📱 Usando número: ${phoneNumber}`);
-        log(LOG_LEVELS.INFO, "📲 Solicitando código (esto puede tomar unos segundos)...");
-
-        // Función para reintentar si falla
+        log(LOG_LEVELS.INFO, `📱 Solicitando código para ${phoneNumber}...`);
         let code = null;
         let attempts = 0;
-        const maxAttempts = 3;
-
-        while (attempts < maxAttempts && !code) {
+        while (attempts < 3 && !code) {
             attempts++;
             try {
-                // Esperar un poco más antes del primer intento (importante en Railway)
-                if (attempts > 1) await new Promise(resolve => setTimeout(resolve, 5000));
-                
                 code = await sock.requestPairingCode(phoneNumber);
-                log(LOG_LEVELS.SUCCESS, `\n✨ CÓDIGO: ${code}\n`);
-                log(LOG_LEVELS.INFO, "📱 Ve a WhatsApp > Dispositivos vinculados > Vincular con número de teléfono");
-                log(LOG_LEVELS.INFO, "📱 Ingresa el código de 8 dígitos que ves arriba.\n");
+                log(LOG_LEVELS.SUCCESS, `✨ CÓDIGO: ${code}\n`);
+                log(LOG_LEVELS.INFO, "Ingresa este código en WhatsApp > Dispositivos vinculados");
             } catch (err) {
-                log(LOG_LEVELS.ERROR, `Intento ${attempts}/${maxAttempts} falló: ${err.message}`);
-                if (attempts === maxAttempts) {
-                    log(LOG_LEVELS.ERROR, "No se pudo generar el código después de varios intentos.");
-                    process.exit(1);
-                }
+                log(LOG_LEVELS.ERROR, `Intento ${attempts} falló: ${err.message}`);
+                if (attempts === 3) process.exit(1);
+                await new Promise(r => setTimeout(r, 5000));
             }
         }
     }
 
-// El resto de tu código (eventos de conexión, etc.) sigue exactamente igual...
-    
-    // Ahora sí, eventos de conexión
+    // Evento de conexión
     sock.ev.on("connection.update", async (update) => {
         const { connection, lastDisconnect } = update;
         if (connection === "open") {
@@ -454,31 +339,31 @@ async function startBot() {
             if (shouldReconnect && reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
                 reconnectAttempts++;
                 const waitTime = 5000 * reconnectAttempts;
-                log(LOG_LEVELS.WARNING, `Reconectando en ${waitTime/1000}s (Intento ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
+                log(LOG_LEVELS.WARNING, `Reconectando en ${waitTime/1000}s (Intento ${reconnectAttempts})`);
                 setTimeout(() => startBot(), waitTime);
             } else if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-                log(LOG_LEVELS.ERROR, "Máximos intentos de reconexión alcanzados");
+                log(LOG_LEVELS.ERROR, "Máximos reintentos alcanzados");
                 process.exit(1);
-            } else {
-                log(LOG_LEVELS.INFO, "Sesión cerrada voluntariamente");
             }
         }
     });
 
     await ensureGifsFolder();
 
-   
-    // Bienvenidas / despedidas
+    // Bienvenidas / despedidas con caché
     sock.ev.on("group-participants.update", async (update) => {
         const { id, participants, action } = update;
-        if (!BOT_CONFIG.welcomeEnabled && !BOT_CONFIG.goodbyeEnabled) return;
+        invalidateGroupCache(id);
+        const welcomeEnabled = getGroupSetting(id, "welcomeEnabled");
+        const goodbyeEnabled = getGroupSetting(id, "goodbyeEnabled");
+        if (!welcomeEnabled && !goodbyeEnabled) return;
         let message = "";
-        if (action === "add" && BOT_CONFIG.welcomeEnabled) {
+        if (action === "add" && welcomeEnabled) {
             const nombre = await getDisplayName(sock, participants[0]);
-            message = `🐱 ¡Bienvenido al grupo ${nombre}!\n\n📌 Lee las reglas y disfruta. ¡${BOT_CONFIG.botName} está aquí para ayudar!\n\n💡 Usa ${BOT_CONFIG.prefix}menu para ver los comandos.`;
-        } else if (action === "remove" && BOT_CONFIG.goodbyeEnabled) {
+            message = `🐱 ¡Bienvenido al grupo ${nombre}!\n📌 Lee las reglas y disfruta. Usa ${BOT_CONFIG.prefix}menu para ver los comandos.`;
+        } else if (action === "remove" && goodbyeEnabled) {
             const nombre = await getDisplayName(sock, participants[0]);
-            message = `👋 ${nombre} ha salido del grupo.\n\n¡Esperamos verte de vuelta pronto!`;
+            message = `👋 ${nombre} ha salido del grupo.\n¡Esperamos verte de vuelta pronto!`;
         }
         if (message) await sock.sendMessage(id, { text: message });
     });
@@ -493,94 +378,49 @@ async function startBot() {
         let text = getMessageText(msg);
         if (!text && !msg.message.imageMessage && !msg.message.videoMessage) return;
 
-// Anti-spam
-        if (isGroup && BOT_CONFIG.antiSpam && text) {
-
-            // Verificar si el usuario es admin
-            let isAdminGroup = false;
-
-            try {
-                const groupMetadata = await sock.groupMetadata(from);
-
-                const participant = groupMetadata.participants.find(
-                    p => p.id === sender
-                );
-
-                if (participant) {
-                    isAdminGroup =
-                        participant.admin === "admin" ||
-                        participant.admin === "superadmin";
+        // Anti-spam (solo grupos)
+        if (isGroup && getGroupSetting(from, "antiSpam")) {
+            const isAdmin = await isUserAdmin(sock, from, sender);
+            if (!isAdmin && isSpam(sender)) {
+                const warnKey = `${from}|${sender}`;
+                botData.warnings[warnKey] = (botData.warnings[warnKey] || 0) + 1;
+                saveData();
+                const currentWarns = botData.warnings[warnKey];
+                const phone = sender.split('@')[0];
+                await sock.sendMessage(from, {
+                    text: `⚠️ @${phone} spam detectado. Advertencia ${currentWarns}/${BOT_CONFIG.maxWarnings}`,
+                    mentions: [sender]
+                });
+                if (currentWarns >= BOT_CONFIG.maxWarnings) {
+                    await sock.groupParticipantsUpdate(from, [sender], "remove");
+                    await sock.sendMessage(from, { text: `🚫 @${phone} expulsado por spam excesivo.`, mentions: [sender] });
+                    delete botData.warnings[warnKey];
+                    saveData();
                 }
-
-            } catch (err) {
-                console.log("Error verificando admin:", err);
-            }
-
-            // Si es admin, ignorar sistema anti-spam
-            if (!isAdminGroup) {
-
-                if (isSpam(sender, text)) {
-
-                    const warnKey = `${from}|${sender}`;
-                    const currentWarns =
-                        (warnings.get(warnKey) || 0) + 1;
-
-                    warnings.set(warnKey, currentWarns);
-
-                    const phone = sender.split('@')[0];
-
-                    await sock.sendMessage(from, {
-                        text:
-                            `⚠️ @${phone} has sido detectado haciendo spam.\n` +
-                            `Advertencia ${currentWarns}/${BOT_CONFIG.maxWarnings}`,
-                        mentions: [sender]
-                    });
-
-                    if (currentWarns >= BOT_CONFIG.maxWarnings) {
-
-                        await sock.groupParticipantsUpdate(
-                            from,
-                            [sender],
-                            "remove"
-                        );
-
-                        await sock.sendMessage(from, {
-                            text:
-                                `🚫 @${phone} ha sido expulsado por spam excesivo.`,
-                            mentions: [sender]
-                        });
-
-                        warnings.delete(warnKey);
-                    }
-
-                    return;
-                }
+                return;
             }
         }
 
         // Anti-enlaces
-        if (isGroup && BOT_CONFIG.antiLink && text && isLink(text)) {
-            try {
-                const groupMetadata = await sock.groupMetadata(from);
-                const isAdminGroup = groupMetadata.participants.find(p => p.id === sender)?.admin === "admin" || groupMetadata.participants.find(p => p.id === sender)?.admin === "superadmin";
-                if (!isAdminGroup) {
-                    const phone = sender.split('@')[0];
-                    await sock.sendMessage(from, { text: `🔗 @${phone} los enlaces no están permitidos en este grupo.`, mentions: [sender] });
-                    await sock.groupParticipantsUpdate(from, [sender], "remove");
-                    return;
-                }
-            } catch (err) {}
+        if (isGroup && getGroupSetting(from, "antiLink") && text && isLink(text)) {
+            const isAdmin = await isUserAdmin(sock, from, sender);
+            if (!isAdmin) {
+                const phone = sender.split('@')[0];
+                await sock.sendMessage(from, { text: `🔗 @${phone} los enlaces no están permitidos.`, mentions: [sender] });
+                await sock.groupParticipantsUpdate(from, [sender], "remove");
+                return;
+            }
         }
 
-        // Verificar mute
+        // Verificar silencios
         const muteKey = `${from}|${sender}`;
-        const muteData = mutedUsers.get(muteKey);
-        if (muteData && Date.now() < muteData) {
+        if (botData.mutedUsers[muteKey] && Date.now() < botData.mutedUsers[muteKey]) {
             const phone = sender.split('@')[0];
-            await sock.sendMessage(from, { text: `🔇 @${phone} estás silenciado. No puedes enviar mensajes.`, mentions: [sender] });
+            await sock.sendMessage(from, { text: `🔇 @${phone} estás silenciado.`, mentions: [sender] });
             return;
-        } else if (muteData && Date.now() >= muteData) {
-            mutedUsers.delete(muteKey);
+        } else if (botData.mutedUsers[muteKey] && Date.now() >= botData.mutedUsers[muteKey]) {
+            delete botData.mutedUsers[muteKey];
+            saveData();
         }
 
         const isCommand = text && text.startsWith(BOT_CONFIG.prefix);
@@ -589,43 +429,36 @@ async function startBot() {
         const command = isCommand ? args.shift().toLowerCase() : null;
 
         // Verificar admin de grupo
-        let isAdmin = false, isSuperAdmin = false;
-        if (isGroup) {
-            try {
-                const groupMetadata = await sock.groupMetadata(from);
-                const participant = groupMetadata.participants.find(p => p.id === sender);
-                if (participant) {
-                    isAdmin = participant.admin === "admin" || participant.admin === "superadmin";
-                    isSuperAdmin = participant.admin === "superadmin";
-                }
-            } catch (err) {}
+        let isAdmin = false;
+        if (isGroup && command) {
+            isAdmin = await isUserAdmin(sock, from, sender);
+            // Solo admins pueden usar comandos de administración
+            const adminCommands = ["ban","kick","mute","unmute","promote","demote","warn","warns","delwarn","resetwarns","delete","del","clear","lock","unlock","antilink","antispam","welcome","goodbye","setname","setdesc","setpp"];
+            if (adminCommands.includes(command) && !isAdmin) {
+                await sock.sendMessage(from, { text: "❌ Solo administradores del grupo pueden usar este comando." });
+                return;
+            }
         }
-
-        if (isGroup && BOT_CONFIG.onlyAdmins && !isAdmin && isCommand) {
-            await sock.sendMessage(from, { text: "❌ Solo administradores pueden usar comandos en este grupo." });
-            return;
-        }
-
-        // Sticker desde imagen
 
         // ==================== COMANDOS ====================
 
         if (command === "hola") {
-            const senderName = await getContactName(sock, sender, msg);
-            await sock.sendMessage(from, { text: `¡Hola ${senderName}! 😺 ¿Cómo estás?\n\nUsa ${BOT_CONFIG.prefix}menu para ver mis comandos.` });
+            const senderName = await getDisplayName(sock, sender);
+            await sock.sendMessage(from, { text: `¡Hola ${senderName}! 😺 Usa ${BOT_CONFIG.prefix}menu para ver mis comandos.` });
         }
 
+        if (command === "ping") {
+            const start = Date.now();
+            await sock.sendMessage(from, { text: "🏓 Calculando ping..." });
+            const end = Date.now();
+            await sock.sendMessage(from, { text: `🏓 Pong! Latencia: ${end - start}ms\n⏱️ ${new Date().toLocaleTimeString()}` });
+        }
 
-
-        // ========== COMANDO !STICKER (para convertir multimedia respondiendo) ==========
         if (command === "sticker" || command === "s") {
             try {
-                // Verificar si se está respondiendo a un mensaje
-                const quotedMsg = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
                 let mediaBuffer, mimeType;
-
+                const quotedMsg = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
                 if (quotedMsg) {
-                    // Obtener el mensaje citado
                     if (quotedMsg.imageMessage) {
                         mediaBuffer = await sock.downloadMediaMessage({ message: quotedMsg });
                         mimeType = quotedMsg.imageMessage.mimetype;
@@ -633,576 +466,397 @@ async function startBot() {
                         mediaBuffer = await sock.downloadMediaMessage({ message: quotedMsg });
                         mimeType = quotedMsg.videoMessage.mimetype;
                     } else {
-                        await sock.sendMessage(from, { text: "❌ Responde a una imagen, GIF o video para convertirlo a sticker." });
+                        await sock.sendMessage(from, { text: "❌ Responde a una imagen, GIF o video." });
                         return;
                     }
                 } else if (msg.message.imageMessage || msg.message.videoMessage) {
-                    // Si el comando se envía junto con el archivo (sin responder)
-                    if (msg.message.imageMessage) {
-                        mediaBuffer = await sock.downloadMediaMessage(msg);
-                        mimeType = msg.message.imageMessage.mimetype;
-                    } else if (msg.message.videoMessage) {
-                        mediaBuffer = await sock.downloadMediaMessage(msg);
-                        mimeType = msg.message.videoMessage.mimetype;
-                    }
+                    mediaBuffer = await sock.downloadMediaMessage(msg);
+                    mimeType = msg.message.imageMessage?.mimetype || msg.message.videoMessage?.mimetype;
                 } else {
                     await sock.sendMessage(from, { text: `❌ Uso: responde a una imagen/GIF/video con ${BOT_CONFIG.prefix}sticker` });
                     return;
                 }
-
-                if (!mediaBuffer) {
-                    await sock.sendMessage(from, { text: "❌ No se pudo descargar el archivo." });
-                    return;
-                }
-
-                const supportedMimes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'video/mp4'];
-                if (!supportedMimes.includes(mimeType)) {
-                    await sock.sendMessage(from, { text: "❌ Formato no soportado. Usa JPG, PNG, GIF o MP4." });
-                    return;
-                }
-
+                if (!mediaBuffer) throw new Error("No se pudo descargar");
                 const stickerBuffer = await createStickerFromMedia(mediaBuffer, mimeType);
-                if (stickerBuffer) {
-                    await sock.sendMessage(from, { sticker: stickerBuffer });
-                    log(LOG_LEVELS.SUCCESS, `Sticker creado con !sticker desde ${mimeType}`);
-                } else {
-                    await sock.sendMessage(from, { text: "❌ Error al crear el sticker." });
-                }
+                if (stickerBuffer) await sock.sendMessage(from, { sticker: stickerBuffer });
+                else await sock.sendMessage(from, { text: "❌ Error al crear sticker." });
             } catch (error) {
-                log(LOG_LEVELS.ERROR, `Error en !sticker: ${error}`);
-                await sock.sendMessage(from, { text: "❌ Error al procesar el comando !sticker" });
+                log(LOG_LEVELS.ERROR, `Error en sticker: ${error}`);
+                await sock.sendMessage(from, { text: "❌ Error al procesar el sticker." });
             }
             return;
-        }
-
-
-        if (command === "ping") {
-            const start = Date.now();
-            await sock.sendMessage(from, { text: "🏓 Calculando ping..." });
-            const end = Date.now();
-            await sock.sendMessage(from, { text: `🏓 Pong!\nLatencia: ${end - start}ms\n⏱️ ${new Date().toLocaleTimeString()}` });
         }
 
         if (command === "kiss") {
             try {
-                let target = null, targetName = null;
-                const senderName = msg.pushName || await getDisplayName(sock, sender);
-                const mentionedUsers = await getMentionedUsersAdvanced(sock, msg, from, isGroup);
-                if (mentionedUsers.length > 0) {
-                    target = mentionedUsers[0];
-                    targetName = await getDisplayName(sock, target);
-                } else if (getQuotedMessageSender(msg)) {
-                    target = getQuotedMessageSender(msg);
-                    targetName = await getDisplayName(sock, target);
-                } else if (isGroup) {
-                    const metadata = await sock.groupMetadata(from);
-                    const otherMembers = metadata.participants.filter(p => p.id !== sender);
-                    if (otherMembers.length) {
-                        const randomMember = otherMembers[Math.floor(Math.random() * otherMembers.length)];
-                        target = randomMember.id;
-                        targetName = await getDisplayName(sock, target);
-                    }
+                let target = null;
+                const senderName = await getDisplayName(sock, sender);
+                // Obtener mencionados o respuesta
+                const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid;
+                if (mentioned && mentioned.length > 0) target = mentioned[0];
+                else if (getQuotedMessageSender(msg)) target = getQuotedMessageSender(msg);
+                else if (isGroup) {
+                    const metadata = await getGroupMetadataCached(sock, from);
+                    const others = metadata.participants.filter(p => p.id !== sender);
+                    if (others.length) target = others[Math.floor(Math.random() * others.length)].id;
                 }
-                const kissPhrases = [
-                    "💕 le dio un beso a", "😘 besó apasionadamente a", "💋 plantó un beso a",
-                    "🌸 le regaló un beso a", "✨ sorprendió con un beso a", "🥰 demostró su amor besando a",
-                    "💖 le robó un beso a", "😳 se armó de valor y besó a", "💫 fundió en un beso a",
-                    "🌹 le dio un beso romántico a", "💗 le dio un besito tierno a", "😍 le dio un beso emocionado a"
-                ];
-                const randomPhrase = kissPhrases[Math.floor(Math.random() * kissPhrases.length)];
-                let kissMessage = "", mentions = [];
+                const phrases = ["💕 le dio un beso a", "😘 besó apasionadamente a", "🌸 le regaló un beso a", "✨ sorprendió con un beso a"];
+                const randomPhrase = phrases[Math.floor(Math.random() * phrases.length)];
+                let message = "", mentions = [];
                 const senderPhone = sender.split('@')[0];
-                if (target === sender) {
-                    kissMessage = `@${senderPhone} se quiere mucho a sí mismo/a y se da un beso 💕`;
-                    mentions.push(sender);
-                } else if (target && targetName) {
+                if (target && target !== sender) {
                     const targetPhone = target.split('@')[0];
-                    kissMessage = `@${senderPhone} ${randomPhrase} @${targetPhone}  💕`;
-                    mentions.push(sender, target);
+                    message = `@${senderPhone} ${randomPhrase} @${targetPhone} 💕`;
+                    mentions = [sender, target];
                 } else {
-                    kissMessage = `@${senderPhone} ${randomPhrase} con mucho cariño 💕`;
-                    mentions.push(sender);
+                    message = `@${senderPhone} se dio un beso a sí mismo 💕`;
+                    mentions = [sender];
                 }
-
-                // Obtener GIF de beso
                 const gifBuffer = await getRandomKissGif();
                 if (gifBuffer) {
-                    // Enviar como GIF normal con texto en caption
-                    await sock.sendMessage(from, {
-                        video: gifBuffer,
-                        gifPlayback: true,
-                        caption: kissMessage,
-                        mentions: mentions
-                    });
+                    await sock.sendMessage(from, { video: gifBuffer, gifPlayback: true, caption: message, mentions });
                 } else {
-                    // Si no hay GIFs, enviar solo el texto
-                    await sock.sendMessage(from, { text: kissMessage, mentions });
+                    await sock.sendMessage(from, { text: message, mentions });
                 }
             } catch (error) {
                 log(LOG_LEVELS.ERROR, `Error en kiss: ${error}`);
-                await sock.sendMessage(from, { text: "❌ Error al procesar el comando !kiss" });
+                await sock.sendMessage(from, { text: "❌ Error en !kiss" });
             }
             return;
         }
 
+        if (command === "detonar" || command === "fruti") {
+            try {
+                let target = null;
+                const senderName = await getDisplayName(sock, sender);
+                const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid;
+                if (mentioned && mentioned.length > 0) target = mentioned[0];
+                else if (getQuotedMessageSender(msg)) target = getQuotedMessageSender(msg);
+                else if (isGroup) {
+                    const metadata = await getGroupMetadataCached(sock, from);
+                    const others = metadata.participants.filter(p => p.id !== sender);
+                    if (others.length) target = others[Math.floor(Math.random() * others.length)].id;
+                }
+                const phrases = [" explotó con ", " hizo detonar a ", " mandó a volar a ", " friendzoneó a "];
+                const randomPhrase = phrases[Math.floor(Math.random() * phrases.length)];
+                let message = "", mentions = [];
+                const senderPhone = sender.split('@')[0];
+                if (target && target !== sender) {
+                    const targetPhone = target.split('@')[0];
+                    message = `@${senderPhone} ${randomPhrase} @${targetPhone} 💥`;
+                    mentions = [sender, target];
+                } else {
+                    message = `@${senderPhone} se autodetonó 💥`;
+                    mentions = [sender];
+                }
+                await sock.sendMessage(from, { text: message, mentions });
+                const stickerBuffer = await getRandomExplosionSticker();
+                if (stickerBuffer) await sock.sendMessage(from, { sticker: stickerBuffer });
+            } catch (error) {
+                log(LOG_LEVELS.ERROR, `Error en detonar: ${error}`);
+                await sock.sendMessage(from, { text: "❌ Error en !detonar" });
+            }
+            return;
+        }
 
         if (command === "menu") {
-            let menuText = `╔════════════════════════════════════╗\n`;
-            menuText += `║           ✨ ${BOT_CONFIG.botName} ✨           ║\n`;
-            menuText += `╠════════════════════════════════════╣\n`;
-            menuText += `║  🤖 COMANDOS BÁSICOS               ║\n`;
-            menuText += `║────────────────────────────────────║\n`;
-            menuText += `║ ${BOT_CONFIG.prefix}hola      - Saludo              ║\n`;
-            menuText += `║ ${BOT_CONFIG.prefix}ping      - Latencia           ║\n`;
-            menuText += `║ ${BOT_CONFIG.prefix}menu      - Este menú          ║\n`;
-            menuText += `║────────────────────────────────────║\n`;
-            menuText += `║  🎨 MULTIMEDIA                     ║\n`;
-            menuText += `║────────────────────────────────────║\n`;
-            menuText += `║ Envía imagen/GIF/video → sticker   ║\n`;
-            menuText += `║ ${BOT_CONFIG.prefix}sticker   - Convierte multimedia  ║\n`;
-            menuText += `║ ${BOT_CONFIG.prefix}s         - (alias)              ║\n`;
-            menuText += `║────────────────────────────────────║\n`;
-            menuText += `║  💕 COMANDOS DE DIVERCIÓN          ║\n`;
-            menuText += `║────────────────────────────────────║\n`;
-            menuText += `║ ${BOT_CONFIG.prefix}kiss @user - Beso anime 💋      ║\n`;
-            menuText += `║ ${BOT_CONFIG.prefix}detonar @user - Hacer la detonacion >:3 💥 ║\n`;
-            menuText += `║ ${BOT_CONFIG.prefix}fruti @user - Frutifantástico 🍍  ║\n`;
+            let menuText = `╔══════════════════════════════╗\n`;
+            menuText += `║     ✨ ${BOT_CONFIG.botName} ✨      ║\n`;
+            menuText += `╠══════════════════════════════╣\n`;
+            menuText += `║ 🤖 BÁSICOS                   ║\n`;
+            menuText += `║ ${BOT_CONFIG.prefix}hola  - Saludo       ║\n`;
+            menuText += `║ ${BOT_CONFIG.prefix}ping  - Latencia     ║\n`;
+            menuText += `║ ${BOT_CONFIG.prefix}menu  - Este menú    ║\n`;
+            menuText += `║──────────────────────────────║\n`;
+            menuText += `║ 🎨 STICKER                   ║\n`;
+            menuText += `║ ${BOT_CONFIG.prefix}sticker - Convierte    ║\n`;
+            menuText += `║──────────────────────────────║\n`;
+            menuText += `║ 💕 DIVERSIÓN                 ║\n`;
+            menuText += `║ ${BOT_CONFIG.prefix}kiss @user     ║\n`;
+            menuText += `║ ${BOT_CONFIG.prefix}detonar @user  ║\n`;
+            menuText += `║ ${BOT_CONFIG.prefix}fruti @user    ║\n`;
             if (isGroup) {
-                menuText += `║────────────────────────────────────║\n`;
-                menuText += `║  📚 COMANDOS DE GRUPO              ║\n`;
-                menuText += `║────────────────────────────────────║\n`;
-                menuText += `║ ${BOT_CONFIG.prefix}grupoinfo - Info del grupo      ║\n`;
-                menuText += `║ ${BOT_CONFIG.prefix}miembros  - Lista de miembros   ║\n`;
-                menuText += `║ ${BOT_CONFIG.prefix}reglas    - Ver/editar reglas   ║\n`;
-                menuText += `║ ${BOT_CONFIG.prefix}admin     - Lista admins        ║\n`;
-                menuText += `║ ${BOT_CONFIG.prefix}link      - Link del grupo      ║\n`;
-                menuText += `║ ${BOT_CONFIG.prefix}pp        - Foto de perfil      ║\n`;
-                menuText += `║ ${BOT_CONFIG.prefix}apk <app>   - Descarga APK de APKPure ║\n`;
-                menuText += `║────────────────────────────────────║\n`;
-                menuText += `║  👑 COMANDOS DE ADMIN              ║\n`;
-                menuText += `║────────────────────────────────────║\n`;
-                menuText += `║ ${BOT_CONFIG.prefix}ban @user    - Expulsar           ║\n`;
-                menuText += `║ ${BOT_CONFIG.prefix}kick @user   - Expulsar (alias)   ║\n`;
-                menuText += `║ ${BOT_CONFIG.prefix}mute @user   - Silenciar (1h)     ║\n`;
-                menuText += `║ ${BOT_CONFIG.prefix}unmute @user - Quitar silencio    ║\n`;
-                menuText += `║ ${BOT_CONFIG.prefix}promote @user - Dar admin         ║\n`;
-                menuText += `║ ${BOT_CONFIG.prefix}demote @user - Quitar admin       ║\n`;
-                menuText += `║ ${BOT_CONFIG.prefix}warn @user   - Advertir           ║\n`;
-                menuText += `║ ${BOT_CONFIG.prefix}warns @user  - Ver warns         ║\n`;
-                menuText += `║ ${BOT_CONFIG.prefix}delwarn @user - Borrar warns      ║\n`;
-                menuText += `║ ${BOT_CONFIG.prefix}resetwarns @user (alias)          ║\n`;
-                menuText += `║ ${BOT_CONFIG.prefix}delete      - Borrar mensaje (resp)║\n`;
-                menuText += `║ ${BOT_CONFIG.prefix}del          - (alias)            ║\n`;
-                menuText += `║ ${BOT_CONFIG.prefix}clear        - Borrar 100 msgs    ║\n`;
-                menuText += `║ ${BOT_CONFIG.prefix}lock         - Cerrar grupo       ║\n`;
-                menuText += `║ ${BOT_CONFIG.prefix}unlock       - Abrir grupo        ║\n`;
-                menuText += `║ ${BOT_CONFIG.prefix}antilink on/off - Anti-enlaces    ║\n`;
-                menuText += `║ ${BOT_CONFIG.prefix}antispam on/off - Anti-spam       ║\n`;
-                menuText += `║ ${BOT_CONFIG.prefix}welcome on/off - Bienvenidas      ║\n`;
-                menuText += `║ ${BOT_CONFIG.prefix}goodbye on/off - Despedidas       ║\n`;
-                menuText += `║ ${BOT_CONFIG.prefix}setname texto - Cambiar nombre    ║\n`;
-                menuText += `║ ${BOT_CONFIG.prefix}setdesc texto - Cambiar desc      ║\n`;
-                menuText += `║ ${BOT_CONFIG.prefix}setpp        - Cambiar ícono      ║\n`;
-                menuText += `║────────────────────────────────────║\n`;
-                menuText += `║  ⭐ COMANDOS DE SUPER ADMIN        ║\n`;
-                menuText += `║────────────────────────────────────║\n`;
-                menuText += `║ ${BOT_CONFIG.prefix}broadcast msg - Difundir           ║\n`;
-                menuText += `║ ${BOT_CONFIG.prefix}stats        - Estadísticas       ║\n`;
+                menuText += `║──────────────────────────────║\n`;
+                menuText += `║ 📚 GRUPO                     ║\n`;
+                menuText += `║ ${BOT_CONFIG.prefix}grupoinfo      ║\n`;
+                menuText += `║ ${BOT_CONFIG.prefix}miembros       ║\n`;
+                menuText += `║ ${BOT_CONFIG.prefix}admin          ║\n`;
+                menuText += `║ ${BOT_CONFIG.prefix}link           ║\n`;
+                menuText += `║ ${BOT_CONFIG.prefix}pp             ║\n`;
+                menuText += `║ ${BOT_CONFIG.prefix}apk <app>      ║\n`;
+                menuText += `║──────────────────────────────║\n`;
+                menuText += `║ 👑 ADMINISTRACIÓN            ║\n`;
+                menuText += `║ ${BOT_CONFIG.prefix}ban @user     ║\n`;
+                menuText += `║ ${BOT_CONFIG.prefix}mute @user    ║\n`;
+                menuText += `║ ${BOT_CONFIG.prefix}unmute @user  ║\n`;
+                menuText += `║ ${BOT_CONFIG.prefix}promote @user ║\n`;
+                menuText += `║ ${BOT_CONFIG.prefix}demote @user  ║\n`;
+                menuText += `║ ${BOT_CONFIG.prefix}warn @user    ║\n`;
+                menuText += `║ ${BOT_CONFIG.prefix}warns @user   ║\n`;
+                menuText += `║ ${BOT_CONFIG.prefix}delwarn @user ║\n`;
+                menuText += `║ ${BOT_CONFIG.prefix}delete (resp) ║\n`;
+                menuText += `║ ${BOT_CONFIG.prefix}lock/unlock   ║\n`;
+                menuText += `║ ${BOT_CONFIG.prefix}antilink on/off║\n`;
+                menuText += `║ ${BOT_CONFIG.prefix}antispam on/off║\n`;
+                menuText += `║ ${BOT_CONFIG.prefix}welcome on/off ║\n`;
+                menuText += `║ ${BOT_CONFIG.prefix}goodbye on/off ║\n`;
+                menuText += `║ ${BOT_CONFIG.prefix}setname texto  ║\n`;
+                menuText += `║ ${BOT_CONFIG.prefix}setdesc texto  ║\n`;
+                menuText += `║ ${BOT_CONFIG.prefix}setpp (imagen) ║\n`;
             }
-            menuText += `╚════════════════════════════════════╝`;
+            menuText += `╚══════════════════════════════╝`;
             await sock.sendMessage(from, { text: menuText });
         }
 
-
-        // ========== COMANDOS DE GRUPO ==========
+        // Comandos de grupo (solo si es grupo)
         if (isGroup) {
             if (command === "grupoinfo") {
                 try {
-                    const metadata = await sock.groupMetadata(from);
-                    const participants = metadata.participants;
-                    const admins = participants.filter(p => p.admin === "admin" || p.admin === "superadmin");
-                    const superAdmins = participants.filter(p => p.admin === "superadmin");
-                    let adminsText = "", adminMentions = [];
+                    const metadata = await getGroupMetadataCached(sock, from);
+                    const admins = metadata.participants.filter(p => p.admin === "admin" || p.admin === "superadmin");
+                    let adminText = "", mentions = [];
                     for (let i = 0; i < Math.min(admins.length, 5); i++) {
-                        const admin = admins[i];
-                        const adminName = await getDisplayName(sock, admin.id);
-                        const phone = admin.id.split('@')[0];
-                        adminsText += `• @${phone} (${adminName})\n`;
-                        adminMentions.push(admin.id);
+                        const a = admins[i];
+                        const name = await getDisplayName(sock, a.id);
+                        adminText += `• @${a.id.split('@')[0]} (${name})\n`;
+                        mentions.push(a.id);
                     }
-                    if (admins.length > 5) adminsText += `• +${admins.length - 5} más\n`;
-                    let info = `📊 INFO DEL GRUPO\n━━━━━━━━━━━━━━━━━━━\n📛 Nombre: ${metadata.subject}\n🆔 ID: ${metadata.id}\n👥 Miembros: ${participants.length}\n👑 Admins: ${admins.length}\n⭐ Super Admins: ${superAdmins.length}\n📝 Tema: ${metadata.desc?.substring(0, 50) || "Sin descripción"}\n🔒 Restringido: ${metadata.restrict ? "Sí" : "No"}\n📢 Anuncios: ${metadata.announce ? "Solo admins" : "Todos pueden enviar"}\n🕒 Creado: ${new Date(metadata.creation * 1000).toLocaleDateString()}\n━━━━━━━━━━━━━━━━━━━\n👑 ADMINISTRADORES:\n${adminsText}`;
-                    await sock.sendMessage(from, { text: info, mentions: adminMentions });
-                } catch (err) { await sock.sendMessage(from, { text: "❌ Error obteniendo info del grupo" }); }
+                    const info = `📊 INFO DEL GRUPO\n━━━━━━━━━━━━━━━━\n📛 Nombre: ${metadata.subject}\n👥 Miembros: ${metadata.participants.length}\n👑 Admins: ${admins.length}\n🔒 Restringido: ${metadata.restrict ? "Sí" : "No"}\n📢 Anuncios: ${metadata.announce ? "Solo admins" : "Todos"}\n━━━━━━━━━━━━━━━━\n👑 ADMINISTRADORES:\n${adminText}`;
+                    await sock.sendMessage(from, { text: info, mentions });
+                } catch { await sock.sendMessage(from, { text: "❌ Error obteniendo info" }); }
             }
 
-
-
-            // ========== COMANDO !APK ==========
             if (command === "apk") {
-                try {
-                    const searchTerm = args.join(" ").trim();
-                    if (!searchTerm) {
-                        await sock.sendMessage(from, { text: `❌ Uso: ${BOT_CONFIG.prefix}apk <nombre> - Busca y descarga APK desde APKPure.\nEjemplo: ${BOT_CONFIG.prefix}apk facebook` });
-                        return;
-                    }
-
-                    await sock.sendMessage(from, { text: `🔍 Buscando "${searchTerm}" en APKPure...` });
-
-                    const apkInfo = await searchApkPure(searchTerm);
-                    if (!apkInfo || !apkInfo.downloadUrl) {
-                        await sock.sendMessage(from, { text: `❌ No se encontró ningún APK para "${searchTerm}". Intenta con otro nombre.` });
-                        return;
-                    }
-
-                    await sock.sendMessage(from, { text: `📥 Descargando ${apkInfo.name}... (puede tomar unos segundos)` });
-
-                    const apkBuffer = await downloadApk(apkInfo.downloadUrl);
-                    if (!apkBuffer || apkBuffer.length < 1000) {
-                        await sock.sendMessage(from, { text: `❌ Error al descargar el APK. El archivo puede no estar disponible.` });
-                        return;
-                    }
-
-                    const sizeMB = (apkBuffer.length / (1024 * 1024)).toFixed(2);
-                    if (apkBuffer.length > 100 * 1024 * 1024) {
-                        await sock.sendMessage(from, { text: `⚠️ El archivo es muy grande (${sizeMB} MB). WhatsApp puede rechazar el envío.` });
-                    }
-
-                    await sock.sendMessage(from, {
-                        document: apkBuffer,
-                        mimetype: 'application/vnd.android.package-archive',
-                        fileName: `${apkInfo.name.replace(/[^a-z0-9]/gi, '_')}.apk`,
-                        caption: `📱 *${apkInfo.name}*\n📦 Tamaño: ${sizeMB} MB\n🔗 Descargado por ${BOT_CONFIG.botName}`
-                    });
-                    log(LOG_LEVELS.SUCCESS, `APK enviado: ${apkInfo.name} (${sizeMB} MB)`);
-                } catch (error) {
-                    log(LOG_LEVELS.ERROR, `Error en !apk: ${error}`);
-                    await sock.sendMessage(from, { text: "❌ Error al procesar el comando !apk. Intenta más tarde." });
-                }
-                return;
-            }
-
-            // ========== COMANDO FRUTIFANTÁSTICO ==========
-            if (command === "detonar" || command === "fruti") {
-                try {
-                    let target = null;
-                    let targetName = null;
-                    
-                    const senderName = msg.pushName || await getDisplayName(sock, sender);
-                    const mentionedUsers = await getMentionedUsersAdvanced(sock, msg, from, isGroup);
-                    
-                    if (mentionedUsers.length > 0) {
-                        target = mentionedUsers[0];
-                        targetName = await getDisplayName(sock, target);
-                    } else if (getQuotedMessageSender(msg)) {
-                        target = getQuotedMessageSender(msg);
-                        targetName = await getDisplayName(sock, target);
-                    } else if (isGroup) {
-                        const metadata = await sock.groupMetadata(from);
-                        const otherMembers = metadata.participants.filter(p => p.id !== sender);
-                        if (otherMembers.length) {
-                            const randomMember = otherMembers[Math.floor(Math.random() * otherMembers.length)];
-                            target = randomMember.id;
-                            targetName = await getDisplayName(sock, target);
-                        }
-                    }
-                    
-                    const frutiPhrases = [
-                        " se violó a", " se detonó a", " se folló a", " le rompió el orto a",
-                        " se cumeo a", " se la jaló en la cara de"
-                    ];
-                    
-                    const randomPhrase = frutiPhrases[Math.floor(Math.random() * frutiPhrases.length)];
-                    let frutiMessage = "", mentions = [];
-                    const senderPhone = sender.split('@')[0];
-                    
-                    if (target === sender) {
-                        frutiMessage = `@${senderPhone} se hizo violó a si mismo`;
-                        mentions.push(sender);
-                    } else if (target && targetName) {
-                        const targetPhone = target.split('@')[0];
-                        frutiMessage = `@${senderPhone} ${randomPhrase} @${targetPhone} (${targetName}) `;
-                        mentions.push(sender, target);
-                    } else {
-                        frutiMessage = `@${senderPhone} ${randomPhrase} el vacío `;
-                        mentions.push(sender);
-                    }
-                    
-                    await sock.sendMessage(from, { text: frutiMessage, mentions });
-                    
-                    // Reutilizar el sticker de explosión (si existe)
-                    const stickerBuffer = await getRandomExplosionSticker();
-                    if (stickerBuffer) {
-                        await sock.sendMessage(from, { sticker: stickerBuffer });
-                    } else {
-                        await sock.sendMessage(from, { text: "SEXOOOOOOOOOOOOOOOOOOOOOOOOOOOOO" });
-                    }
-                    
-                    log(LOG_LEVELS.INFO, `!frutifantastico usado por ${senderName} → ${targetName || "nadie"}`);
-                    
-                } catch (error) {
-                    log(LOG_LEVELS.ERROR, `Error en frutifantastico: ${error}`);
-                    await sock.sendMessage(from, { text: "❌ Error al hacer el frutifantástico" });
-                }
+                const searchTerm = args.join(" ").trim();
+                if (!searchTerm) return await sock.sendMessage(from, { text: `❌ Uso: ${BOT_CONFIG.prefix}apk <nombre>` });
+                await sock.sendMessage(from, { text: `🔍 Buscando "${searchTerm}"...` });
+                const apkInfo = await searchApkPure(searchTerm);
+                if (!apkInfo) return await sock.sendMessage(from, { text: "❌ No se encontró APK." });
+                await sock.sendMessage(from, { text: `📥 Descargando ${apkInfo.name}...` });
+                const apkBuffer = await downloadApk(apkInfo.downloadUrl);
+                if (!apkBuffer || apkBuffer.length < 1000) return await sock.sendMessage(from, { text: "❌ Error en descarga." });
+                const sizeMB = (apkBuffer.length / (1024*1024)).toFixed(2);
+                await sock.sendMessage(from, {
+                    document: apkBuffer,
+                    mimetype: 'application/vnd.android.package-archive',
+                    fileName: `${apkInfo.name.replace(/[^a-z0-9]/gi, '_')}.apk`,
+                    caption: `📱 ${apkInfo.name}\n📦 ${sizeMB} MB`
+                });
                 return;
             }
 
             if (command === "admin" || command === "admins") {
-                try {
-                    const metadata = await sock.groupMetadata(from);
-                    const admins = metadata.participants.filter(p => p.admin === "admin" || p.admin === "superadmin");
-                    let adminList = "👑 LISTA DE ADMINISTRADORES:\n━━━━━━━━━━━━━━━━━\n";
-                    const mentions = [];
-                    for (let i = 0; i < admins.length; i++) {
-                        const admin = admins[i];
-                        const adminName = await getDisplayName(sock, admin.id);
-                        const phoneNumber = admin.id.split('@')[0];
-                        const adminTag = admin.admin === "superadmin" ? "🌟 " : "👑 ";
-                        adminList += `${adminTag}${i+1}. @${phoneNumber}\n`;
-                        mentions.push(admin.id);
-                    }
-                    await sock.sendMessage(from, { text: adminList, mentions });
-                } catch (err) { await sock.sendMessage(from, { text: "❌ Error obteniendo admins" }); }
+                const metadata = await getGroupMetadataCached(sock, from);
+                const admins = metadata.participants.filter(p => p.admin === "admin" || p.admin === "superadmin");
+                let list = "👑 ADMINISTRADORES:\n", mentions = [];
+                for (let i=0; i<admins.length; i++) {
+                    const a = admins[i];
+                    const name = await getDisplayName(sock, a.id);
+                    list += `${a.admin === "superadmin" ? "🌟" : "👑"} ${i+1}. @${a.id.split('@')[0]} (${name})\n`;
+                    mentions.push(a.id);
+                }
+                await sock.sendMessage(from, { text: list, mentions });
             }
 
             if (command === "miembros") {
-                try {
-                    const metadata = await sock.groupMetadata(from);
-                    let miembrosList = "👥 LISTA DE MIEMBROS:\n━━━━━━━━━━━━━━━━━\n";
-                    const participants = metadata.participants;
-                    const mentions = [];
-                    for (let i = 0; i < Math.min(participants.length, 20); i++) {
-                        const p = participants[i];
-                        const nombreReal = await getDisplayName(sock, p.id);
-                        const phoneNumber = p.id.split('@')[0];
-                        const adminTag = p.admin === "admin" ? "👑 " : p.admin === "superadmin" ? "🌟 " : "  ";
-                        miembrosList += `${adminTag}${i+1}. @${phoneNumber}\n`;
-                        mentions.push(p.id);
-                    }
-                    if (participants.length > 20) miembrosList += `\n... y ${participants.length - 20} miembros más`;
-                    miembrosList += `\n━━━━━━━━━━━━━━━━━\n📊 Total: ${participants.length} miembros`;
-                    await sock.sendMessage(from, { text: miembrosList, mentions });
-                } catch (err) { await sock.sendMessage(from, { text: "❌ Error obteniendo miembros" }); }
+                const metadata = await getGroupMetadataCached(sock, from);
+                let list = "👥 MIEMBROS:\n", mentions = [];
+                const participants = metadata.participants.slice(0, 20);
+                for (let i=0; i<participants.length; i++) {
+                    const p = participants[i];
+                    const name = await getDisplayName(sock, p.id);
+                    list += `${p.admin ? "👑" : "  "} ${i+1}. @${p.id.split('@')[0]} (${name})\n`;
+                    mentions.push(p.id);
+                }
+                if (metadata.participants.length > 20) list += `\n... y ${metadata.participants.length-20} más`;
+                await sock.sendMessage(from, { text: list, mentions });
             }
 
             if (command === "link") {
                 try {
-                    const inviteCode = await sock.groupInviteCode(from);
-                    await sock.sendMessage(from, { text: `🔗 Link de invitación:\nhttps://chat.whatsapp.com/${inviteCode}` });
-                } catch (err) { await sock.sendMessage(from, { text: "❌ No se pudo obtener el link. Asegúrate de que soy admin." }); }
+                    const code = await sock.groupInviteCode(from);
+                    await sock.sendMessage(from, { text: `🔗 https://chat.whatsapp.com/${code}` });
+                } catch { await sock.sendMessage(from, { text: "❌ No se pudo obtener el link (¿soy admin?)" }); }
             }
 
             if (command === "pp") {
                 try {
-                    const ppUrl = await sock.profilePictureUrl(from, "image");
-                    await sock.sendMessage(from, { text: `🖼️ Foto de perfil del grupo:\n${ppUrl}` });
-                } catch (err) { await sock.sendMessage(from, { text: "❌ El grupo no tiene foto de perfil." }); }
+                    const url = await sock.profilePictureUrl(from, "image");
+                    await sock.sendMessage(from, { text: `🖼️ Foto: ${url}` });
+                } catch { await sock.sendMessage(from, { text: "❌ Grupo sin foto de perfil." }); }
             }
 
-            if (command === "reglas") {
-                if (args[0] === "set" && args.length > 1 && isAdmin) {
-                    const rules = args.slice(1).join(" ");
-                    fs.writeFileSync(`./rules_${from}.txt`, rules);
-                    await sock.sendMessage(from, { text: `📋 Reglas actualizadas:\n━━━━━━━━━━━━━━━━━\n${rules}` });
-                } else {
-                    let rules = "📋 REGLAS DEL GRUPO\n━━━━━━━━━━━━━━━━━\n";
-                    if (fs.existsSync(`./rules_${from}.txt`)) rules += fs.readFileSync(`./rules_${from}.txt`, "utf-8");
-                    else rules += `1️⃣ Respeta a todos los miembros\n2️⃣ Sin spam ni publicidad\n3️⃣ Contenido apropiado\n4️⃣ No compartir números sin permiso\n5️⃣ Sigue las instrucciones de los admins\n\n✏️ Usa "${BOT_CONFIG.prefix}reglas set [texto]" para actualizar`;
-                    await sock.sendMessage(from, { text: rules });
-                }
-            }
-
-            // ========== ADMINISTRACIÓN ==========
-            if (!isAdmin && !["menu","hola","ping","kiss","grupoinfo","miembros","reglas","admin"].includes(command)) {
-                await sock.sendMessage(from, { text: "❌ Solo administradores pueden usar este comando." });
-                return;
-            }
-
-            function getMentionedJids(msg) {
-                const jids = [];
-                if (msg.message?.extendedTextMessage?.contextInfo?.mentionedJid) jids.push(...msg.message.extendedTextMessage.contextInfo.mentionedJid);
-                if (msg.message?.extendedTextMessage?.contextInfo?.participant) jids.push(msg.message.extendedTextMessage.contextInfo.participant);
-                return jids;
-            }
-
+            // Comandos de administración (solo admins)
             if (command === "ban" || command === "kick") {
-                let mentioned = getMentionedJids(msg);
-                if (mentioned.length === 0 && getQuotedMessageSender(msg)) mentioned.push(getQuotedMessageSender(msg));
-                if (mentioned.length === 0) return await sock.sendMessage(from, { text: "❌ Menciona al usuario que quieres expulsar o responde a su mensaje." });
-                for (const user of mentioned) {
-                    try {
-                        await sock.groupParticipantsUpdate(from, [user], "remove");
-                        const userName = await getDisplayName(sock, user);
-                        const phone = user.split('@')[0];
-                        await sock.sendMessage(from, { text: `🚫 @${phone} (${userName}) ha sido expulsado del grupo.`, mentions: [user] });
-                    } catch { await sock.sendMessage(from, { text: `❌ No se pudo expulsar al usuario` }); }
-                }
+                const mentioned = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid || [];
+                let target = mentioned[0] || getQuotedMessageSender(msg);
+                if (!target) return await sock.sendMessage(from, { text: "❌ Menciona o responde al usuario." });
+                await sock.groupParticipantsUpdate(from, [target], "remove");
+                const name = await getDisplayName(sock, target);
+                await sock.sendMessage(from, { text: `🚫 ${name} expulsado.`, mentions: [target] });
             }
 
             if (command === "mute") {
-                let mentioned = getMentionedJids(msg);
-                if (mentioned.length === 0 && getQuotedMessageSender(msg)) mentioned.push(getQuotedMessageSender(msg));
-                if (mentioned.length === 0) return await sock.sendMessage(from, { text: "❌ Menciona al usuario que quieres silenciar o responde a su mensaje." });
-                let duration = 3600000;
-                if (args.length > 0 && !isNaN(args[0]) && !args[0].startsWith("@")) duration = parseInt(args[0]) * 60000;
-                for (const user of mentioned) {
-                    mutedUsers.set(`${from}|${user}`, Date.now() + duration);
-                    const userName = await getDisplayName(sock, user);
-                    const phone = user.split('@')[0];
-                    const durationText = duration === 3600000 ? "1 hora" : `${duration/60000} minutos`;
-                    await sock.sendMessage(from, { text: `🔇 @${phone} (${userName}) ha sido silenciado por ${durationText}.`, mentions: [user] });
-                }
+                let target = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0] || getQuotedMessageSender(msg);
+                if (!target) return await sock.sendMessage(from, { text: "❌ Menciona al usuario." });
+                let duration = 3600000; // 1 hora por defecto
+                if (args[0] && !isNaN(args[0])) duration = parseInt(args[0]) * 60000;
+                botData.mutedUsers[`${from}|${target}`] = Date.now() + duration;
+                saveData();
+                const name = await getDisplayName(sock, target);
+                await sock.sendMessage(from, { text: `🔇 ${name} silenciado por ${duration/60000} minutos.`, mentions: [target] });
             }
 
-
-            // ========== COMANDO FRUTIFANTÁSTICO ==========
-
-
-
             if (command === "unmute") {
-                let mentioned = getMentionedJids(msg);
-                if (mentioned.length === 0 && getQuotedMessageSender(msg)) mentioned.push(getQuotedMessageSender(msg));
-                if (mentioned.length === 0) return await sock.sendMessage(from, { text: "❌ Menciona al usuario que quieres desilenciar o responde a su mensaje." });
-                for (const user of mentioned) {
-                    mutedUsers.delete(`${from}|${user}`);
-                    const userName = await getDisplayName(sock, user);
-                    const phone = user.split('@')[0];
-                    await sock.sendMessage(from, { text: `🔊 @${phone} (${userName}) ya puede enviar mensajes.`, mentions: [user] });
-                }
+                let target = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0] || getQuotedMessageSender(msg);
+                if (!target) return await sock.sendMessage(from, { text: "❌ Menciona al usuario." });
+                delete botData.mutedUsers[`${from}|${target}`];
+                saveData();
+                const name = await getDisplayName(sock, target);
+                await sock.sendMessage(from, { text: `🔊 ${name} desilenciado.`, mentions: [target] });
             }
 
             if (command === "promote") {
-                let mentioned = getMentionedJids(msg);
-                if (mentioned.length === 0 && getQuotedMessageSender(msg)) mentioned.push(getQuotedMessageSender(msg));
-                if (mentioned.length === 0) return await sock.sendMessage(from, { text: "❌ Menciona al usuario que quieres hacer admin o responde a su mensaje." });
-                for (const user of mentioned) {
-                    try {
-                        await sock.groupParticipantsUpdate(from, [user], "promote");
-                        const userName = await getDisplayName(sock, user);
-                        const phone = user.split('@')[0];
-                        await sock.sendMessage(from, { text: `👑 @${phone} (${userName}) ahora es administrador.`, mentions: [user] });
-                    } catch { await sock.sendMessage(from, { text: `❌ No se pudo promover al usuario` }); }
-                }
+                let target = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0] || getQuotedMessageSender(msg);
+                if (!target) return await sock.sendMessage(from, { text: "❌ Menciona al usuario." });
+                await sock.groupParticipantsUpdate(from, [target], "promote");
+                invalidateGroupCache(from);
+                await sock.sendMessage(from, { text: `👑 Promovido a admin.`, mentions: [target] });
             }
 
             if (command === "demote") {
-                let mentioned = getMentionedJids(msg);
-                if (mentioned.length === 0 && getQuotedMessageSender(msg)) mentioned.push(getQuotedMessageSender(msg));
-                if (mentioned.length === 0) return await sock.sendMessage(from, { text: "❌ Menciona al usuario que quieres quitar admin o responde a su mensaje." });
-                for (const user of mentioned) {
-                    try {
-                        await sock.groupParticipantsUpdate(from, [user], "demote");
-                        const userName = await getDisplayName(sock, user);
-                        const phone = user.split('@')[0];
-                        await sock.sendMessage(from, { text: `📛 @${phone} (${userName}) ya no es administrador.`, mentions: [user] });
-                    } catch { await sock.sendMessage(from, { text: `❌ No se pudo degradar al usuario` }); }
-                }
+                let target = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0] || getQuotedMessageSender(msg);
+                if (!target) return await sock.sendMessage(from, { text: "❌ Menciona al usuario." });
+                await sock.groupParticipantsUpdate(from, [target], "demote");
+                invalidateGroupCache(from);
+                await sock.sendMessage(from, { text: `📛 Admin revocado.`, mentions: [target] });
             }
 
             if (command === "warn") {
-                let mentioned = getMentionedJids(msg);
-                if (mentioned.length === 0 && getQuotedMessageSender(msg)) mentioned.push(getQuotedMessageSender(msg));
-                if (mentioned.length === 0) return await sock.sendMessage(from, { text: "❌ Menciona al usuario que quieres advertir o responde a su mensaje." });
-                for (const user of mentioned) {
-                    const warnKey = `${from}|${user}`;
-                    const currentWarns = (warnings.get(warnKey) || 0) + 1;
-                    warnings.set(warnKey, currentWarns);
-                    const userName = await getDisplayName(sock, user);
-                    const phone = user.split('@')[0];
-                    await sock.sendMessage(from, { text: `⚠️ @${phone} (${userName}) ha recibido una advertencia.\nAdvertencias: ${currentWarns}/${BOT_CONFIG.maxWarnings}`, mentions: [user] });
-                    if (currentWarns >= BOT_CONFIG.maxWarnings) {
-                        await sock.groupParticipantsUpdate(from, [user], "remove");
-                        await sock.sendMessage(from, { text: `🚫 @${phone} (${userName}) ha sido expulsado por exceder el límite de advertencias.`, mentions: [user] });
-                        warnings.delete(warnKey);
-                    }
+                let target = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0] || getQuotedMessageSender(msg);
+                if (!target) return await sock.sendMessage(from, { text: "❌ Menciona al usuario." });
+                const key = `${from}|${target}`;
+                botData.warnings[key] = (botData.warnings[key] || 0) + 1;
+                saveData();
+                const current = botData.warnings[key];
+                await sock.sendMessage(from, { text: `⚠️ Advertencia ${current}/${BOT_CONFIG.maxWarnings}`, mentions: [target] });
+                if (current >= BOT_CONFIG.maxWarnings) {
+                    await sock.groupParticipantsUpdate(from, [target], "remove");
+                    delete botData.warnings[key];
+                    saveData();
+                    await sock.sendMessage(from, { text: `🚫 Usuario expulsado por exceso de advertencias.`, mentions: [target] });
                 }
             }
 
             if (command === "warns") {
-                let mentioned = getMentionedJids(msg);
-                if (mentioned.length === 0 && getQuotedMessageSender(msg)) mentioned.push(getQuotedMessageSender(msg));
-                if (mentioned.length === 0) return await sock.sendMessage(from, { text: "❌ Menciona al usuario para ver sus advertencias o responde a su mensaje." });
-                for (const user of mentioned) {
-                    const warnKey = `${from}|${user}`;
-                    const currentWarns = warnings.get(warnKey) || 0;
-                    const userName = await getDisplayName(sock, user);
-                    const phone = user.split('@')[0];
-                    await sock.sendMessage(from, { text: `📋 @${phone} (${userName}) tiene ${currentWarns}/${BOT_CONFIG.maxWarnings} advertencias.`, mentions: [user] });
-                }
+                let target = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0] || getQuotedMessageSender(msg);
+                if (!target) return await sock.sendMessage(from, { text: "❌ Menciona al usuario." });
+                const key = `${from}|${target}`;
+                const warns = botData.warnings[key] || 0;
+                await sock.sendMessage(from, { text: `📋 Advertencias: ${warns}/${BOT_CONFIG.maxWarnings}`, mentions: [target] });
             }
 
             if (command === "delwarn" || command === "resetwarns") {
-                let mentioned = getMentionedJids(msg);
-                if (mentioned.length === 0 && getQuotedMessageSender(msg)) mentioned.push(getQuotedMessageSender(msg));
-                if (mentioned.length === 0) return await sock.sendMessage(from, { text: "❌ Menciona al usuario para borrar sus advertencias o responde a su mensaje." });
-                for (const user of mentioned) {
-                    warnings.delete(`${from}|${user}`);
-                    const userName = await getDisplayName(sock, user);
-                    const phone = user.split('@')[0];
-                    await sock.sendMessage(from, { text: `✅ Se han borrado las advertencias de @${phone} (${userName}).`, mentions: [user] });
-                }
+                let target = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0] || getQuotedMessageSender(msg);
+                if (!target) return await sock.sendMessage(from, { text: "❌ Menciona al usuario." });
+                delete botData.warnings[`${from}|${target}`];
+                saveData();
+                await sock.sendMessage(from, { text: `✅ Advertencias borradas.`, mentions: [target] });
             }
 
             if (command === "delete" || command === "del") {
-                const quotedMsgId = getQuotedMessageId(msg);
+                const quotedId = getQuotedMessageId(msg);
                 const quotedParticipant = getQuotedMessageSender(msg);
-                if (quotedMsgId) {
-                    const key = { remoteJid: from, fromMe: false, id: quotedMsgId, participant: quotedParticipant || from };
-                    await sock.sendMessage(from, { delete: key });
-                    await sock.sendMessage(from, { text: "✅ Mensaje eliminado." });
-                } else await sock.sendMessage(from, { text: "❌ Responde al mensaje que quieres eliminar con !delete" });
+                if (!quotedId) return await sock.sendMessage(from, { text: "❌ Responde al mensaje a eliminar." });
+                const key = { remoteJid: from, fromMe: false, id: quotedId, participant: quotedParticipant || from };
+                await sock.sendMessage(from, { delete: key });
+                await sock.sendMessage(from, { text: "✅ Mensaje eliminado." });
             }
 
-            if (command === "clear") await sock.sendMessage(from, { text: "⚠️ Esta función no está completamente soportada en WhatsApp Web." });
-            if (command === "lock") { await sock.groupSettingUpdate(from, "announcement"); await sock.sendMessage(from, { text: "🔒 Grupo cerrado. Solo admins pueden enviar mensajes." }); }
-            if (command === "unlock") { await sock.groupSettingUpdate(from, "not_announcement"); await sock.sendMessage(from, { text: "🔓 Grupo abierto. Todos pueden enviar mensajes." }); }
+            if (command === "lock") {
+                await sock.groupSettingUpdate(from, "announcement");
+                await sock.sendMessage(from, { text: "🔒 Grupo cerrado (solo admins)." });
+            }
+            if (command === "unlock") {
+                await sock.groupSettingUpdate(from, "not_announcement");
+                await sock.sendMessage(from, { text: "🔓 Grupo abierto (todos pueden enviar)." });
+            }
 
             if (command === "antilink") {
-                if (args[0] === "on") { BOT_CONFIG.antiLink = true; await sock.sendMessage(from, { text: "✅ Anti-enlaces activado." }); }
-                else if (args[0] === "off") { BOT_CONFIG.antiLink = false; await sock.sendMessage(from, { text: "❌ Anti-enlaces desactivado." }); }
-                else await sock.sendMessage(from, { text: `📋 Anti-enlaces: ${BOT_CONFIG.antiLink ? "activado" : "desactivado"}\nUsa ${BOT_CONFIG.prefix}antilink on/off` });
+                const newVal = args[0] === "on";
+                if (args[0] && (args[0]==="on"||args[0]==="off")) {
+                    setGroupSetting(from, "antiLink", newVal);
+                    await sock.sendMessage(from, { text: `✅ Anti-enlaces ${newVal ? "activado" : "desactivado"}.` });
+                } else {
+                    const current = getGroupSetting(from, "antiLink");
+                    await sock.sendMessage(from, { text: `📋 Anti-enlaces: ${current ? "activado" : "desactivado"}\nUsa ${BOT_CONFIG.prefix}antilink on/off` });
+                }
             }
             if (command === "antispam") {
-                if (args[0] === "on") { BOT_CONFIG.antiSpam = true; await sock.sendMessage(from, { text: "✅ Anti-spam activado." }); }
-                else if (args[0] === "off") { BOT_CONFIG.antiSpam = false; await sock.sendMessage(from, { text: "❌ Anti-spam desactivado." }); }
-                else await sock.sendMessage(from, { text: `📋 Anti-spam: ${BOT_CONFIG.antiSpam ? "activado" : "desactivado"}\nUsa ${BOT_CONFIG.prefix}antispam on/off` });
+                const newVal = args[0] === "on";
+                if (args[0] && (args[0]==="on"||args[0]==="off")) {
+                    setGroupSetting(from, "antiSpam", newVal);
+                    await sock.sendMessage(from, { text: `✅ Anti-spam ${newVal ? "activado" : "desactivado"}.` });
+                } else {
+                    const current = getGroupSetting(from, "antiSpam");
+                    await sock.sendMessage(from, { text: `📋 Anti-spam: ${current ? "activado" : "desactivado"}` });
+                }
             }
             if (command === "welcome") {
-                if (args[0] === "on") { BOT_CONFIG.welcomeEnabled = true; await sock.sendMessage(from, { text: "✅ Mensajes de bienvenida activados." }); }
-                else if (args[0] === "off") { BOT_CONFIG.welcomeEnabled = false; await sock.sendMessage(from, { text: "❌ Mensajes de bienvenida desactivados." }); }
-                else await sock.sendMessage(from, { text: `📋 Bienvenidas: ${BOT_CONFIG.welcomeEnabled ? "activadas" : "desactivadas"}` });
+                const newVal = args[0] === "on";
+                if (args[0] && (args[0]==="on"||args[0]==="off")) {
+                    setGroupSetting(from, "welcomeEnabled", newVal);
+                    await sock.sendMessage(from, { text: `✅ Bienvenidas ${newVal ? "activadas" : "desactivadas"}.` });
+                } else {
+                    const current = getGroupSetting(from, "welcomeEnabled");
+                    await sock.sendMessage(from, { text: `📋 Bienvenidas: ${current ? "activadas" : "desactivadas"}` });
+                }
             }
             if (command === "goodbye") {
-                if (args[0] === "on") { BOT_CONFIG.goodbyeEnabled = true; await sock.sendMessage(from, { text: "✅ Mensajes de despedida activados." }); }
-                else if (args[0] === "off") { BOT_CONFIG.goodbyeEnabled = false; await sock.sendMessage(from, { text: "❌ Mensajes de despedida desactivados." }); }
-                else await sock.sendMessage(from, { text: `📋 Despedidas: ${BOT_CONFIG.goodbyeEnabled ? "activadas" : "desactivadas"}` });
+                const newVal = args[0] === "on";
+                if (args[0] && (args[0]==="on"||args[0]==="off")) {
+                    setGroupSetting(from, "goodbyeEnabled", newVal);
+                    await sock.sendMessage(from, { text: `✅ Despedidas ${newVal ? "activadas" : "desactivadas"}.` });
+                } else {
+                    const current = getGroupSetting(from, "goodbyeEnabled");
+                    await sock.sendMessage(from, { text: `📋 Despedidas: ${current ? "activadas" : "desactivadas"}` });
+                }
             }
             if (command === "setname") {
                 const newName = args.join(" ");
-                if (!newName) return await sock.sendMessage(from, { text: "❌ Escribe el nuevo nombre del grupo.\nEjemplo: !setname Mi Grupo" });
+                if (!newName) return await sock.sendMessage(from, { text: "❌ Escribe el nuevo nombre." });
                 await sock.groupUpdateSubject(from, newName);
-                await sock.sendMessage(from, { text: `✅ Nombre del grupo actualizado a: ${newName}` });
+                invalidateGroupCache(from);
+                await sock.sendMessage(from, { text: `✅ Nombre actualizado a: ${newName}` });
             }
             if (command === "setdesc") {
                 const newDesc = args.join(" ");
-                if (!newDesc) return await sock.sendMessage(from, { text: "❌ Escribe la nueva descripción.\nEjemplo: !setdesc Bienvenidos al grupo" });
+                if (!newDesc) return await sock.sendMessage(from, { text: "❌ Escribe la nueva descripción." });
                 await sock.groupUpdateDescription(from, newDesc);
                 await sock.sendMessage(from, { text: `✅ Descripción actualizada.` });
             }
-            if (command === "setpp" && msg.message.imageMessage) {
+            if (command === "setpp" && (msg.message.imageMessage || msg.message.extendedTextMessage?.contextInfo?.quotedMessage?.imageMessage)) {
                 try {
-                    const media = await sock.downloadMediaMessage(msg);
-                    await sock.updateProfilePicture(from, media);
-                    await sock.sendMessage(from, { text: "✅ Foto de perfil del grupo actualizada." });
-                } catch { await sock.sendMessage(from, { text: "❌ Error al actualizar la foto. Asegúrate de enviar una imagen con el comando." }); }
+                    let mediaMsg = msg.message;
+                    if (msg.message.extendedTextMessage?.contextInfo?.quotedMessage?.imageMessage) {
+                        mediaMsg = { message: msg.message.extendedTextMessage.contextInfo.quotedMessage };
+                    }
+                    const buffer = await sock.downloadMediaMessage(mediaMsg);
+                    await sock.updateProfilePicture(from, buffer);
+                    invalidateGroupCache(from);
+                    await sock.sendMessage(from, { text: "✅ Foto de grupo actualizada." });
+                } catch (e) {
+                    await sock.sendMessage(from, { text: "❌ Error al actualizar foto. Envía una imagen con el comando o responde a una." });
+                }
             }
         }
 
-        // ========== COMANDOS PARA ADMINS DEL BOT ==========
-        const isBotAdmin = BOT_CONFIG.admins.includes(sender.split('@')[0]);
-        if (isBotAdmin && command === "broadcast") {
+        // Comandos para el dueño del bot (broadcast, stats)
+        const senderNumber = sender.split('@')[0];
+        const isOwner = (senderNumber === BOT_CONFIG.ownerNumber);
+        if (isOwner && command === "broadcast") {
             const broadcastMsg = args.join(" ");
-            if (!broadcastMsg) return await sock.sendMessage(from, { text: "❌ Escribe un mensaje para difundir" });
+            if (!broadcastMsg) return await sock.sendMessage(from, { text: "❌ Escribe un mensaje para difundir." });
             await sock.sendMessage(from, { text: "📢 Iniciando difusión..." });
             const groups = await sock.groupFetchAllParticipating();
             let sent = 0, failed = 0;
@@ -1210,16 +864,16 @@ async function startBot() {
                 try {
                     await sock.sendMessage(groupId, { text: `📢 ANUNCIO:\n\n${broadcastMsg}` });
                     sent++;
-                    await new Promise(resolve => setTimeout(resolve, 1500));
+                    await new Promise(r => setTimeout(r, 1500));
                 } catch { failed++; }
             }
-            await sock.sendMessage(from, { text: `✅ Difusión completada!\n📨 Enviados: ${sent} grupos\n❌ Fallidos: ${failed} grupos` });
+            await sock.sendMessage(from, { text: `✅ Difusión completada\n📨 Enviados: ${sent}\n❌ Fallidos: ${failed}` });
         }
-        if (isBotAdmin && command === "stats") {
+        if (isOwner && command === "stats") {
             const uptime = process.uptime();
-            const hours = Math.floor(uptime / 3600), minutes = Math.floor((uptime % 3600) / 60), seconds = Math.floor(uptime % 60);
-            const gifsCount = fs.existsSync(path.join(__dirname, 'gifs')) ? fs.readdirSync(path.join(__dirname, 'gifs')).filter(f => f.endsWith('.gif') || f.endsWith('.mp4')).length : 0;
-            const stats = `📊 ESTADÍSTICAS DEL BOT\n━━━━━━━━━━━━━━━━━\n⏱️ Uptime: ${hours}h ${minutes}m ${seconds}s\n🤖 Nombre: ${BOT_CONFIG.botName}\n📋 Prefijo: ${BOT_CONFIG.prefix}\n💋 Kiss: Activo (${gifsCount} GIFs)\n🛡️ Anti-spam: ${BOT_CONFIG.antiSpam ? "Activado" : "Desactivado"}\n🔗 Anti-link: ${BOT_CONFIG.antiLink ? "Activado" : "Desactivado"}`;
+            const hours = Math.floor(uptime/3600), mins = Math.floor((uptime%3600)/60), secs = Math.floor(uptime%60);
+            const gifsCount = fs.existsSync("./gifs") ? fs.readdirSync("./gifs").filter(f=>f.endsWith('.gif')).length : 0;
+            const stats = `📊 ESTADÍSTICAS\n━━━━━━━━━━━━━\n⏱️ Uptime: ${hours}h ${mins}m ${secs}s\n🤖 ${BOT_CONFIG.botName}\n📋 Prefijo: ${BOT_CONFIG.prefix}\n💋 GIFs beso: ${gifsCount}\n🛡️ Anti-spam global: activado\n🔗 Anti-link por grupo: configurable`;
             await sock.sendMessage(from, { text: stats });
         }
     });
@@ -1229,4 +883,4 @@ process.on("uncaughtException", (err) => log(LOG_LEVELS.ERROR, `Error no captura
 process.on("unhandledRejection", (reason) => log(LOG_LEVELS.ERROR, `Promesa rechazada: ${reason}`));
 
 log(LOG_LEVELS.BOT, `Iniciando ${BOT_CONFIG.botName}...`);
-startBot().catch(err => { log(LOG_LEVELS.ERROR, `Error fatal: ${err.message}`); process.exit(1); });>
+startBot().catch(err => { log(LOG_LEVELS.ERROR, `Error fatal: ${err.message}`); process.exit(1); });
