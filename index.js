@@ -1,4 +1,4 @@
-const {
+<const {
     default: makeWASocket,
     useMultiFileAuthState,
     DisconnectReason
@@ -493,20 +493,68 @@ async function startBot() {
         let text = getMessageText(msg);
         if (!text && !msg.message.imageMessage && !msg.message.videoMessage) return;
 
-        // Anti-spam
+// Anti-spam
         if (isGroup && BOT_CONFIG.antiSpam && text) {
-            if (isSpam(sender, text)) {
-                const warnKey = `${from}|${sender}`;
-                const currentWarns = (warnings.get(warnKey) || 0) + 1;
-                warnings.set(warnKey, currentWarns);
-                const phone = sender.split('@')[0];
-                await sock.sendMessage(from, { text: `⚠️ @${phone} has sido detectado haciendo spam.\nAdvertencia ${currentWarns}/${BOT_CONFIG.maxWarnings}`, mentions: [sender] });
-                if (currentWarns >= BOT_CONFIG.maxWarnings) {
-                    await sock.groupParticipantsUpdate(from, [sender], "remove");
-                    await sock.sendMessage(from, { text: `🚫 @${phone} ha sido expulsado por spam excesivo.`, mentions: [sender] });
-                    warnings.delete(warnKey);
+
+            // Verificar si el usuario es admin
+            let isAdminGroup = false;
+
+            try {
+                const groupMetadata = await sock.groupMetadata(from);
+
+                const participant = groupMetadata.participants.find(
+                    p => p.id === sender
+                );
+
+                if (participant) {
+                    isAdminGroup =
+                        participant.admin === "admin" ||
+                        participant.admin === "superadmin";
                 }
-                return;
+
+            } catch (err) {
+                console.log("Error verificando admin:", err);
+            }
+
+            // Si es admin, ignorar sistema anti-spam
+            if (!isAdminGroup) {
+
+                if (isSpam(sender, text)) {
+
+                    const warnKey = `${from}|${sender}`;
+                    const currentWarns =
+                        (warnings.get(warnKey) || 0) + 1;
+
+                    warnings.set(warnKey, currentWarns);
+
+                    const phone = sender.split('@')[0];
+
+                    await sock.sendMessage(from, {
+                        text:
+                            `⚠️ @${phone} has sido detectado haciendo spam.\n` +
+                            `Advertencia ${currentWarns}/${BOT_CONFIG.maxWarnings}`,
+                        mentions: [sender]
+                    });
+
+                    if (currentWarns >= BOT_CONFIG.maxWarnings) {
+
+                        await sock.groupParticipantsUpdate(
+                            from,
+                            [sender],
+                            "remove"
+                        );
+
+                        await sock.sendMessage(from, {
+                            text:
+                                `🚫 @${phone} ha sido expulsado por spam excesivo.`,
+                            mentions: [sender]
+                        });
+
+                        warnings.delete(warnKey);
+                    }
+
+                    return;
+                }
             }
         }
 
@@ -1181,4 +1229,4 @@ process.on("uncaughtException", (err) => log(LOG_LEVELS.ERROR, `Error no captura
 process.on("unhandledRejection", (reason) => log(LOG_LEVELS.ERROR, `Promesa rechazada: ${reason}`));
 
 log(LOG_LEVELS.BOT, `Iniciando ${BOT_CONFIG.botName}...`);
-startBot().catch(err => { log(LOG_LEVELS.ERROR, `Error fatal: ${err.message}`); process.exit(1); });
+startBot().catch(err => { log(LOG_LEVELS.ERROR, `Error fatal: ${err.message}`); process.exit(1); });>
